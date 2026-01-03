@@ -10,39 +10,10 @@ use libcamera::{
     properties,
     stream::StreamRole,
 };
+use yuv::{yuv420_to_rgb, YuvChromaSubsampling, YuvPlanarImageMut, YuvRange, YuvStandardMatrix};
 
 // YUYV pixel format (YUV 4:2:2)
 const PIXEL_FORMAT_YUYV: PixelFormat = PixelFormat::new(u32::from_le_bytes([b'Y', b'U', b'Y', b'V']), 0);
-
-fn yuyv_to_rgb(yuyv_data: &[u8], width: usize, height: usize) -> Vec<u8> {
-    let mut rgb_data = Vec::with_capacity(width * height * 3);
-
-    // YUYV format: each 4 bytes represent 2 pixels
-    // [Y0 U Y1 V] -> pixel0(Y0,U,V) pixel1(Y1,U,V)
-    for chunk in yuyv_data.chunks_exact(4) {
-        let y0 = chunk[0] as i32;
-        let u = chunk[1] as i32;
-        let y1 = chunk[2] as i32;
-        let v = chunk[3] as i32;
-
-        // Convert YUV to RGB for both pixels
-        for &y in &[y0, y1] {
-            let c = y - 16;
-            let d = u - 128;
-            let e = v - 128;
-
-            let r = ((298 * c + 409 * e + 128) >> 8).clamp(0, 255) as u8;
-            let g = ((298 * c - 100 * d - 208 * e + 128) >> 8).clamp(0, 255) as u8;
-            let b = ((298 * c + 516 * d + 128) >> 8).clamp(0, 255) as u8;
-
-            rgb_data.push(r);
-            rgb_data.push(g);
-            rgb_data.push(b);
-        }
-    }
-
-    rgb_data
-}
 
 fn main() {
     let filename = std::env::args().nth(1).expect("Usage ./raspi-cam <filename.jpg>");
@@ -135,11 +106,26 @@ fn main() {
     let bytes_used = framebuffer.metadata().unwrap().planes().get(0).unwrap().bytes_used as usize;
 
     println!("Converting YUYV to RGB...");
-    let rgb_data = yuyv_to_rgb(&yuyv_data[..bytes_used], width, height);
+
+    let mut yuv_planar_image_mut =
+        YuvPlanarImageMut::<u8>::alloc(width as u32, height as u32, YuvChromaSubsampling::Yuv420);
+    let yuv_planar_image = yuv_planar_image_mut.to_fixed();
+
+    let mut rgba = vec![0u8; width * height * 4];
+    let rgba_stride = width * 4;
+
+    yuv420_to_rgb(
+        &yuv_planar_image,
+        &mut rgba,
+        rgba_stride as u32,
+        YuvRange::Limited,
+        YuvStandardMatrix::Bt601,
+    )
+        .unwrap();
 
     println!("Encoding JPEG...");
     // Encode RGB data to JPEG using the image crate
-    let img = image::RgbImage::from_raw(width as u32, height as u32, rgb_data)
+    let img = image::RgbaImage::from_raw(width as u32, height as u32, rgba)
         .expect("Failed to create image from RGB data");
 
     img.save(&filename).expect("Failed to save JPEG");
