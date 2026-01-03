@@ -4,6 +4,11 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-libcamera = "0.6.0"
-image = "0.25.9"
-yuv = "0.8.9"
+ndi = { git = "https://github.com/maxjoehnk/ndi-rs", branch = "feature/ndi-5" }
+color-eyre = "0.6"
+clap = { version = "4.5", features = ["derive"] }
+libcamera = "0.6"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+yuvutils-rs = { version = "0.8", features = ["rayon"] }
+turbojpeg = "1.3"
