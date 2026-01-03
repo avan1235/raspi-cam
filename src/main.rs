@@ -2,6 +2,7 @@ use std::ops::{Deref, DerefMut};
 use std::time::Duration;
 use clap::Parser;
 use color_eyre::eyre::Context;
+use image::{ImageBuffer, RgbaImage};
 use libcamera::camera_manager::CameraManager;
 use libcamera::*;
 use libcamera::camera::{Camera, CameraConfiguration, CameraConfigurationStatus};
@@ -164,11 +165,18 @@ fn main() -> color_eyre::Result<()> {
         {
             let instant = std::time::Instant::now();
             tracing::debug!("Sent to NDI in {:?}", instant.elapsed());
+            save_as_png(&buffer, cfg.get_size().width, cfg.get_size().height, "./test.png")?;
         }
 
         last_capture = std::time::Instant::now();
         buffer.swap();
     }
+}
+
+fn save_as_png(rgba_data: &[u8], width: u32, height: u32, path: &str) -> Result<(), image::ImageError> {
+    let img: RgbaImage = ImageBuffer::from_raw(width, height, rgba_data.to_vec())
+        .expect("Invalid buffer size");
+    img.save(path)
 }
 
 trait CameraStream {
