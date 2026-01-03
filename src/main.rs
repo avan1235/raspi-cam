@@ -11,8 +11,38 @@ use libcamera::{
     stream::StreamRole,
 };
 
-// drm-fourcc does not have MJPEG type yet, construct it from raw fourcc identifier
-const PIXEL_FORMAT_MJPEG: PixelFormat = PixelFormat::new(u32::from_le_bytes([b'M', b'J', b'P', b'G']), 0);
+// YUYV pixel format (YUV 4:2:2)
+const PIXEL_FORMAT_YUYV: PixelFormat = PixelFormat::new(u32::from_le_bytes([b'Y', b'U', b'Y', b'V']), 0);
+
+fn yuyv_to_rgb(yuyv_data: &[u8], width: usize, height: usize) -> Vec<u8> {
+    let mut rgb_data = Vec::with_capacity(width * height * 3);
+
+    // YUYV format: each 4 bytes represent 2 pixels
+    // [Y0 U Y1 V] -> pixel0(Y0,U,V) pixel1(Y1,U,V)
+    for chunk in yuyv_data.chunks_exact(4) {
+        let y0 = chunk[0] as i32;
+        let u = chunk[1] as i32;
+        let y1 = chunk[2] as i32;
+        let v = chunk[3] as i32;
+
+        // Convert YUV to RGB for both pixels
+        for &y in &[y0, y1] {
+            let c = y - 16;
+            let d = u - 128;
+            let e = v - 128;
+
+            let r = ((298 * c + 409 * e + 128) >> 8).clamp(0, 255) as u8;
+            let g = ((298 * c - 100 * d - 208 * e + 128) >> 8).clamp(0, 255) as u8;
+            let b = ((298 * c + 516 * d + 128) >> 8).clamp(0, 255) as u8;
+
+            rgb_data.push(r);
+            rgb_data.push(g);
+            rgb_data.push(b);
+        }
+    }
+
+    rgb_data
+}
 
 fn main() {
     let filename = std::env::args().nth(1).expect("Usage ./raspi-cam <filename.jpg>");
@@ -35,8 +65,8 @@ fn main() {
     // This will generate default configuration for each specified role
     let mut cfgs = cam.generate_configuration(&[StreamRole::ViewFinder]).unwrap();
 
-    // Use MJPEG format so we can write resulting frame directly into jpeg file
-    cfgs.get_mut(0).unwrap().set_pixel_format(PIXEL_FORMAT_MJPEG);
+    // Use YUYV format since MJPEG is not supported
+    cfgs.get_mut(0).unwrap().set_pixel_format(PIXEL_FORMAT_YUYV);
 
     println!("Generated config: {cfgs:#?}");
 
@@ -45,13 +75,6 @@ fn main() {
         CameraConfigurationStatus::Adjusted => println!("Camera configuration was adjusted: {cfgs:#?}"),
         CameraConfigurationStatus::Invalid => panic!("Error validating camera configuration"),
     }
-
-    // Ensure that pixel format was unchanged
-    assert_eq!(
-        cfgs.get(0).unwrap().get_pixel_format(),
-        PIXEL_FORMAT_MJPEG,
-        "MJPEG is not supported by the camera"
-    );
 
     cam.configure(&mut cfgs).expect("Unable to configure camera");
 
@@ -62,6 +85,11 @@ fn main() {
     let stream = cfg.stream().unwrap();
     let buffers = alloc.alloc(&stream).unwrap();
     println!("Allocated {} buffers", buffers.len());
+
+    // Get the actual width and height from the configuration
+    let width = cfg.get_size().width as usize;
+    let height = cfg.get_size().height as usize;
+    println!("Capture size: {}x{}", width, height);
 
     // Convert FrameBuffer to MemoryMappedFrameBuffer, which allows reading &[u8]
     let buffers = buffers
@@ -101,12 +129,20 @@ fn main() {
     let framebuffer: &MemoryMappedFrameBuffer<FrameBuffer> = req.buffer(&stream).unwrap();
     println!("FrameBuffer metadata: {:#?}", framebuffer.metadata());
 
-    // MJPEG format has only one data plane containing encoded jpeg data with all the headers
+    // YUYV format has one data plane
     let planes = framebuffer.data();
-    let jpeg_data = planes.first().unwrap();
-    // Actual JPEG-encoded data will be smalled than framebuffer size, its length can be obtained from metadata.
-    let jpeg_len = framebuffer.metadata().unwrap().planes().get(0).unwrap().bytes_used as usize;
+    let yuyv_data = planes.first().unwrap();
+    let bytes_used = framebuffer.metadata().unwrap().planes().get(0).unwrap().bytes_used as usize;
 
-    std::fs::write(&filename, &jpeg_data[..jpeg_len]).unwrap();
-    println!("Written {} bytes to {}", jpeg_len, &filename);
+    println!("Converting YUYV to RGB...");
+    let rgb_data = yuyv_to_rgb(&yuyv_data[..bytes_used], width, height);
+
+    println!("Encoding JPEG...");
+    // Encode RGB data to JPEG using the image crate
+    let img = image::RgbImage::from_raw(width as u32, height as u32, rgb_data)
+        .expect("Failed to create image from RGB data");
+
+    img.save(&filename).expect("Failed to save JPEG");
+
+    println!("Written image to {}", &filename);
 }
