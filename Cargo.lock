@@ -433,11 +433,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "ndi"
-version = "0.1.2"
-source = "git+https://github.com/maxjoehnk/ndi-rs?branch=feature%2Fndi-5#25a2356017e315370685998674d6c15491d2ac76"
-
-[[package]]
 name = "nom"
 version = "7.1.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -570,7 +565,6 @@ dependencies = [
  "clap",
  "color-eyre",
  "libcamera",
- "ndi",
  "tracing",
  "tracing-subscriber",
  "yuvutils-rs",

@@ -3,9 +3,8 @@ use libcamera::camera::{Camera, CameraConfiguration};
 use libcamera::color_space::Range;
 use libcamera::pixel_format::PixelFormat;
 use libcamera::stream::StreamConfigurationRef;
-use ndi::{FourCCVideoType};
 use yuvutils_rs::{yuyv422_to_rgba, YuvPackedImage, YuvRange, YuvStandardMatrix};
-use super::{supports_configuration, CameraStream, FrameInfo};
+use super::{supports_configuration, CameraStream};
 
 pub struct YuyvStream;
 
@@ -18,7 +17,7 @@ impl CameraStream for YuyvStream {
         supports_configuration(camera, PixelFormat::from_str("YUYV").unwrap())
     }
 
-    fn convert_frame(&self, cfg: &StreamConfigurationRef, frame: &[u8], target_buffer: &mut [u8]) -> color_eyre::Result<FrameInfo> {
+    fn convert_frame(&self, cfg: &StreamConfigurationRef, frame: &[u8], target_buffer: &mut [u8]) -> color_eyre::Result<()> {
         let rgb_stride = cfg.get_size().width * 4;
 
         let yuv_image = YuvPackedImage {
@@ -39,9 +38,6 @@ impl CameraStream for YuyvStream {
             YuvStandardMatrix::Bt709, // TODO: read from cfg
         )?;
 
-        Ok(FrameInfo {
-            video_type: FourCCVideoType::RGBX,
-            stride: rgb_stride,
-        })
+        Ok(())
     }
 }

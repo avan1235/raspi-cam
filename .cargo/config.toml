@@ -1,8 +1,0 @@
-[target.armv7-unknown-linux-gnueabihf]
-rustflags = ["-C", "target-cpu=native"]
-
-[target.x86_64-unknown-linux-gnu]
-rustflags = ["-C", "target-feature=+avx2,+sse4.2"]
-
-[target.'cfg(target_os = "macos")']
-rustflags = ["-C", "target-cpu=apple-m1"]

@@ -12,7 +12,6 @@ use libcamera::geometry::Size;
 use libcamera::pixel_format::PixelFormat;
 use libcamera::request::{ReuseFlag};
 use libcamera::stream::{StreamConfigurationRef, StreamRole};
-use ndi::{FourCCVideoType, FrameFormatType, VideoData};
 use tracing_subscriber::fmt;
 use tracing_subscriber::prelude::*;
 use tracing_subscriber::EnvFilter;
@@ -20,7 +19,6 @@ use crate::buffer::DoubleBuffer;
 
 mod yuyv;
 mod buffer;
-mod ndi_sender;
 
 #[derive(Debug, Clone, Parser)]
 #[command(version)]
@@ -42,7 +40,6 @@ fn main() -> color_eyre::Result<()> {
         Box::new(yuyv::YuyvStream),
     ];
 
-    ndi::initialize()?;
     let flags = Flags::parse();
     tracing_subscriber::registry()
         .with(fmt::layer())
@@ -122,8 +119,6 @@ fn main() -> color_eyre::Result<()> {
         cam.queue_request(req).map_err(|(_, e)| e)?;
     }
 
-    let ndi_sender = ndi_sender::NdiSender::new(cfg.get_size(), flags.fps)?;
-
     let mut buffer = DoubleBuffer::new(cfg.get_size());
 
     let mut last_capture = std::time::Instant::now();
@@ -158,21 +153,16 @@ fn main() -> color_eyre::Result<()> {
             &frame_data[..bytes_used]
         };
 
-        let frame_info = {
-            let instant = std::time::Instant::now();
-            // TODO: Can we run this conversion and sending to ndi in the background as well to reduce latency?
-            let frame_info = camera_stream.convert_frame(&cfg, frame_data, &mut buffer)?;
-            tracing::debug!("Converted to {:?} in {:?}", frame_info.video_type, instant.elapsed());
-
-            frame_info
-        };
+        let instant = std::time::Instant::now();
+        // TODO: Can we run this conversion and sending to ndi in the background as well to reduce latency?
+        camera_stream.convert_frame(&cfg, frame_data, &mut buffer)?;
+        tracing::debug!("Converted in {:?}", instant.elapsed());
 
         req.reuse(ReuseFlag::REUSE_BUFFERS);
         cam.queue_request(req).map_err(|(_, e)| e)?;
 
         {
             let instant = std::time::Instant::now();
-            ndi_sender.send(&mut buffer, &frame_info)?;
             tracing::debug!("Sent to NDI in {:?}", instant.elapsed());
         }
 
@@ -186,12 +176,7 @@ trait CameraStream {
 
     fn is_supported(&self, camera: &Camera) -> Option<CameraConfiguration>;
 
-    fn convert_frame(&self, configuration: &StreamConfigurationRef, data: &[u8], target_buffer: &mut [u8]) -> color_eyre::Result<FrameInfo>;
-}
-
-pub struct FrameInfo {
-    pub video_type: FourCCVideoType,
-    pub stride: u32,
+    fn convert_frame(&self, configuration: &StreamConfigurationRef, data: &[u8], target_buffer: &mut [u8]) -> color_eyre::Result<()>;
 }
 
 fn supports_configuration(cam: &Camera, format: PixelFormat) -> Option<CameraConfiguration> {
