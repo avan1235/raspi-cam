@@ -18,10 +18,7 @@ use tracing_subscriber::prelude::*;
 use tracing_subscriber::EnvFilter;
 use crate::buffer::DoubleBuffer;
 
-mod rgb;
-mod bgr;
 mod yuyv;
-mod mjpeg;
 mod buffer;
 mod ndi_sender;
 
@@ -42,10 +39,7 @@ pub struct Flags {
 
 fn main() -> color_eyre::Result<()> {
     let stream_formats: Vec<Box<dyn CameraStream>> = vec![
-        Box::new(bgr::BgrStream),
-        Box::new(rgb::RgbStream),
         Box::new(yuyv::YuyvStream),
-        Box::new(mjpeg::MjpegStream),
     ];
 
     ndi::initialize()?;
