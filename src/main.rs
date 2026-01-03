@@ -21,6 +21,8 @@ fn main() {
 
     let cameras = mgr.cameras();
 
+    println!("Found {} cameras, using first one", cameras.len());
+
     let cam = cameras.get(0).expect("No cameras found");
 
     println!(
