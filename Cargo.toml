@@ -11,3 +11,7 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 yuvutils-rs = { version = "0.8", features = ["rayon"] }
 image = "0.25"
+tokio = { version = "1.49", features = ["full"] }
+tokio-tungstenite = "0.28"
+tungstenite = "0.28"
+futures-util = "0.3"
