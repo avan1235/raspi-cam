@@ -32,12 +32,6 @@ pub struct Flags {
     pub width: u32,
     #[arg(long, default_value_t = 1080)]
     pub height: u32,
-    #[arg(short, long, default_value_t = 60)]
-    pub fps: u32,
-    #[arg(short, long)]
-    pub name: Option<String>,
-    #[arg(long)]
-    pub format: Option<String>,
     #[arg(long, default_value = "0.0.0.0:8080")]
     pub websocket_address: String,
 }
@@ -210,14 +204,7 @@ fn run_camera_capture(
     let mut cam = cam.acquire()?;
 
     let stream_formats = vec![yuyv::YuyvStream];
-    let camera_stream = if let Some(format_name) = flags.format {
-        let format_name = format_name.to_lowercase();
-        stream_formats.into_iter().find_map(|stream| {
-            (stream.name() == format_name).then_some(()).and(stream.is_supported(&cam).map(|cfg| (stream, cfg)))
-        })
-    } else {
-        stream_formats.into_iter().find_map(|stream| stream.is_supported(&cam).map(|cfg| (stream, cfg)))
-    };
+    let camera_stream = stream_formats.into_iter().find_map(|stream| stream.is_supported(&cam).map(|cfg| (stream, cfg)));
 
     let Some((camera_stream, mut cfg)) = camera_stream else {
         color_eyre::eyre::bail!("No supported stream format found");
