@@ -311,6 +311,7 @@ fn run_camera_capture(
 
         last_capture = std::time::Instant::now();
         buffer.swap();
+        std::thread::sleep(Duration::from_secs(1));
     }
 }
 
