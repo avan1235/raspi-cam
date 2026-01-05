@@ -327,10 +327,10 @@ fn run_camera_capture(
     }
 }
 
-fn encode_as_jpeg_turbo(rgb_data: &[u8], width: u32, height: u32, quality: i32) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
-    let mut compressor = Compressor::new()?;
-    compressor.set_quality(quality)?;
-    compressor.set_subsamp(Subsamp::Sub2x2)?;
+fn encode_as_jpeg_turbo(rgb_data: &[u8], width: u32, height: u32, quality: i32) -> Result<Vec<u8>, String> {
+    let mut compressor = Compressor::new().map_err(|e| e.to_string())?;
+    compressor.set_quality(quality).map_err(|e| e.to_string())?;
+    compressor.set_subsamp(Subsamp::Sub2x2).map_err(|e| e.to_string())?;
 
     let image = Image {
         pixels: rgb_data,
@@ -340,7 +340,7 @@ fn encode_as_jpeg_turbo(rgb_data: &[u8], width: u32, height: u32, quality: i32) 
         format: TJPixelFormat::RGB,
     };
 
-    let jpeg_data = compressor.compress_to_vec(image)?;
+    let jpeg_data = compressor.compress_to_vec(image).map_err(|e| e.to_string())?;
     Ok(jpeg_data)
 }
 
