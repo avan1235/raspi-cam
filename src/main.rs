@@ -161,15 +161,16 @@ async fn handle_client(stream: TcpStream, frame_buffer: SharedFrameBuffer, clien
                     };
 
                     let encode_duration = encode_start.elapsed();
+                    let bytes_count = jpeg_data.len();
                     tracing::debug!(
                         "PNG encoding completed for {}: {} bytes in {:?}",
                         client_addr,
-                        jpeg_data.len(),
+                        bytes_count,
                         encode_duration
                     );
 
                     let send_start = std::time::Instant::now();
-                    if let Err(e) = write.send(Message::Binary(jpeg_data.as_ref().into())).await {
+                    if let Err(e) = write.send(Message::Binary(jpeg_data.into())).await {
                         tracing::error!("Error sending frame to {}: {}", client_addr, e);
                         break;
                     }
@@ -177,9 +178,9 @@ async fn handle_client(stream: TcpStream, frame_buffer: SharedFrameBuffer, clien
                     tracing::debug!(
                         "Frame sent to {} successfully: {} bytes in {:?} ({:.2} MB/s)",
                         client_addr,
-                        jpeg_data.len(),
+                        bytes_count,
                         send_duration,
-                        jpeg_data.len() as f64 / send_duration.as_secs_f64() / 1_000_000.0
+                        bytes_count as f64 / send_duration.as_secs_f64() / 1_000_000.0
                     );
                 } else {
                     tracing::debug!("Received unknown command from {}: {:?}", client_addr, text);
