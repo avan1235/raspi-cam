@@ -1,7 +1,6 @@
 use std::ops::{Deref, DerefMut};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
-use arc_swap::ArcSwap;
 use clap::Parser;
 use color_eyre::eyre::Context;
 use image::{ImageBuffer, RgbaImage};
@@ -37,39 +36,32 @@ pub struct Flags {
     pub websocket_address: String,
 }
 
-// Frame data structure
-struct FrameData {
-    data: Vec<u8>,
+// Shared state for the latest frame
+#[derive(Clone)]
+struct SharedFrameBuffer {
+    data: Arc<Mutex<Option<Vec<u8>>>>,
     width: u32,
     height: u32,
 }
 
-// Shared state for the latest frame using ArcSwap
-#[derive(Clone)]
-struct SharedFrameBuffer {
-    frame: Arc<ArcSwap<Option<FrameData>>>,
-}
-
 impl SharedFrameBuffer {
-    fn new() -> Self {
+    fn new(width: u32, height: u32) -> Self {
         Self {
-            frame: Arc::new(ArcSwap::from_pointee(None)),
+            data: Arc::new(Mutex::new(None)),
+            width,
+            height,
         }
     }
 
-    fn update(&self, frame_data: Vec<u8>, width: u32, height: u32) {
-        let new_frame = FrameData {
-            data: frame_data,
-            width,
-            height,
-        };
-        self.frame.store(Arc::new(Some(new_frame)));
+    fn update(&self, frame_data: &[u8]) {
+        let mut data = self.data.lock().unwrap();
+        *data = Some(frame_data.to_vec());
     }
 
     fn get_png(&self) -> Option<Vec<u8>> {
-        let frame_arc = self.frame.load();
-        frame_arc.as_ref().and_then(|frame| {
-            encode_as_png(&frame.data, frame.width, frame.height).ok()
+        let data = self.data.lock().unwrap();
+        data.as_ref().and_then(|rgba_data| {
+            encode_as_png(rgba_data, self.width, self.height).ok()
         })
     }
 }
@@ -82,7 +74,7 @@ async fn main() -> color_eyre::Result<()> {
         .with(EnvFilter::from_default_env())
         .init();
 
-    let frame_buffer = SharedFrameBuffer::new();
+    let frame_buffer = SharedFrameBuffer::new(flags.width, flags.height);
 
     // Start WebSocket server
     let ws_addr = flags.websocket_address.clone();
@@ -145,7 +137,7 @@ async fn handle_client(stream: TcpStream, frame_buffer: SharedFrameBuffer, clien
                         Some(png_data) => {
                             let data_size = png_data.len();
                             tracing::debug!("Encoding PNG for client {}: {} bytes", client_addr, data_size);
-
+                            
                             let send_start = std::time::Instant::now();
                             if let Err(e) = write.send(Message::Binary(png_data.into())).await {
                                 tracing::error!("Error sending frame to {}: {}", client_addr, e);
@@ -191,7 +183,7 @@ async fn handle_client(stream: TcpStream, frame_buffer: SharedFrameBuffer, clien
             }
         }
     }
-
+    
     tracing::debug!("Connection handler for {} terminated", client_addr);
 }
 
@@ -301,8 +293,8 @@ fn run_camera_capture(
         req.reuse(ReuseFlag::REUSE_BUFFERS);
         cam.queue_request(req).map_err(|(_, e)| e)?;
 
-        // Update shared frame buffer with ArcSwap (lock-free!)
-        frame_buffer.update(buffer.deref().to_vec(), flags.width, flags.height);
+        // Update shared frame buffer
+        frame_buffer.update(buffer.deref());
 
         last_capture = std::time::Instant::now();
         buffer.swap();
