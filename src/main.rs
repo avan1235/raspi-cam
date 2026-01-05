@@ -144,14 +144,14 @@ async fn handle_client(stream: TcpStream, frame_buffer: SharedFrameBuffer, clien
                     let width = frame_buffer.width;
                     let height = frame_buffer.height;
 
-                    // Move PNG encoding to blocking thread pool
+                    // Move JPEG encoding to blocking thread pool
                     let encode_start = std::time::Instant::now();
-                    let png_data = match tokio::task::spawn_blocking(move || {
-                        encode_as_png(&rgba_data, width, height)
+                    let jpeg_data = match tokio::task::spawn_blocking(move || {
+                        encode_as_jpeg(&rgba_data, width, height)
                     }).await {
                         Ok(Ok(data)) => data,
                         Ok(Err(e)) => {
-                            tracing::error!("PNG encoding error for client {}: {}", client_addr, e);
+                            tracing::error!("JPEG encoding error for client {}: {}", client_addr, e);
                             continue;
                         }
                         Err(e) => {
@@ -163,14 +163,15 @@ async fn handle_client(stream: TcpStream, frame_buffer: SharedFrameBuffer, clien
                     let encode_duration = encode_start.elapsed();
                     let data_len = png_data.len();
                     tracing::debug!(
-                        "PNG encoding completed for {}: {} bytes in {:?}",
+                        "JPEG encoding completed for {}: {} bytes in {:?}",
                         client_addr,
                         data_len,
                         encode_duration
                     );
 
                     let send_start = std::time::Instant::now();
-                    if let Err(e) = write.send(Message::Binary(png_data.into())).await {
+                    let data_len = jpeg_data.len();
+                    if let Err(e) = write.send(Message::Binary(jpeg_data.into())).await {
                         tracing::error!("Error sending frame to {}: {}", client_addr, e);
                         break;
                     }
@@ -326,18 +327,23 @@ fn run_camera_capture(
     }
 }
 
-fn encode_as_png(rgba_data: &[u8], width: u32, height: u32) -> Result<Vec<u8>, image::ImageError> {
-    let img: RgbaImage = ImageBuffer::from_raw(width, height, rgba_data.to_vec())
+fn encode_as_jpeg(rgba_data: &[u8], width: u32, height: u32) -> Result<Vec<u8>, image::ImageError> {
+    // Convert RGBA to RGB (strip alpha channel)
+    let rgb_data: Vec<u8> = rgba_data
+        .chunks_exact(4)
+        .flat_map(|pixel| [pixel[0], pixel[1], pixel[2]])
+        .collect();
+
+    let img: image::RgbaImage = ImageBuffer::from_raw(width, height, rgb_data)
         .expect("Invalid buffer size");
 
-    let mut png_data = Vec::new();
-    let mut cursor = std::io::Cursor::new(&mut png_data);
+    let mut jpeg_data = Vec::new();
+    let mut cursor = std::io::Cursor::new(&mut jpeg_data);
 
-    use image::codecs::png::{PngEncoder, CompressionType, FilterType};
-    let encoder = PngEncoder::new_with_quality(&mut cursor, CompressionType::Fast, FilterType::NoFilter);
-    encoder.write_image(&img, width, height, image::ExtendedColorType::Rgba8)?;
+    // Use JPEG with quality 85 (good balance of quality and speed)
+    img.write_to(&mut cursor, image::ImageFormat::Jpeg)?;
 
-    Ok(png_data)
+    Ok(jpeg_data)
 }
 
 trait CameraStream {
