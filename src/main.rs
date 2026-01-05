@@ -161,7 +161,7 @@ async fn handle_client(stream: TcpStream, frame_buffer: SharedFrameBuffer, clien
                     };
 
                     let encode_duration = encode_start.elapsed();
-                    let data_len = png_data.len();
+                    let data_len = jpeg_data.len();
                     tracing::debug!(
                         "JPEG encoding completed for {}: {} bytes in {:?}",
                         client_addr,
@@ -170,7 +170,6 @@ async fn handle_client(stream: TcpStream, frame_buffer: SharedFrameBuffer, clien
                     );
 
                     let send_start = std::time::Instant::now();
-                    let data_len = jpeg_data.len();
                     if let Err(e) = write.send(Message::Binary(jpeg_data.into())).await {
                         tracing::error!("Error sending frame to {}: {}", client_addr, e);
                         break;
