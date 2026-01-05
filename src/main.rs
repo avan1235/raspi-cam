@@ -74,10 +74,6 @@ impl SharedFrameBuffer {
 
 #[tokio::main]
 async fn main() -> color_eyre::Result<()> {
-    let stream_formats: Vec<Box<dyn CameraStream>> = vec![
-        Box::new(yuyv::YuyvStream),
-    ];
-
     let flags = Flags::parse();
     tracing_subscriber::registry()
         .with(fmt::layer())
@@ -98,7 +94,7 @@ async fn main() -> color_eyre::Result<()> {
     // Run camera capture in blocking thread
     let flags_clone = flags.clone();
     tokio::task::spawn_blocking(move || {
-        if let Err(e) = run_camera_capture(stream_formats, flags_clone, frame_buffer) {
+        if let Err(e) = run_camera_capture(flags_clone, frame_buffer) {
             tracing::error!("Camera capture error: {}", e);
         }
     }).await?;
@@ -164,7 +160,6 @@ async fn handle_client(stream: TcpStream, frame_buffer: SharedFrameBuffer) {
 }
 
 fn run_camera_capture(
-    stream_formats: Vec<Box<dyn CameraStream>>,
     flags: Flags,
     frame_buffer: SharedFrameBuffer,
 ) -> color_eyre::Result<()> {
@@ -180,6 +175,7 @@ fn run_camera_capture(
 
     let mut cam = cam.acquire()?;
 
+    let stream_formats = vec![yuyv::YuyvStream];
     let camera_stream = if let Some(format_name) = flags.format {
         let format_name = format_name.to_lowercase();
         stream_formats.into_iter().find_map(|stream| {
