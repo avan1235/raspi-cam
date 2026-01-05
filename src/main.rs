@@ -20,6 +20,7 @@ use tracing_subscriber::EnvFilter;
 use tokio::net::{TcpListener, TcpStream};
 use tokio_tungstenite::{accept_async, tungstenite::Message};
 use futures_util::{StreamExt, SinkExt};
+use turbojpeg::{Compressor, Image, PixelFormat as TJPixelFormat, Subsamp};
 use crate::buffer::DoubleBuffer;
 
 mod yuyv;
@@ -34,6 +35,8 @@ pub struct Flags {
     pub height: u32,
     #[arg(long, default_value = "0.0.0.0:8080")]
     pub websocket_address: String,
+    #[arg(long, default_value_t = 60)]
+    pub jpeg_quality: i32,
 }
 
 // Shared state for the latest frame
@@ -145,7 +148,7 @@ async fn handle_client(stream: TcpStream, frame_buffer: SharedFrameBuffer, clien
                     // Move JPEG encoding to blocking thread pool
                     let encode_start = std::time::Instant::now();
                     let jpeg_data = match tokio::task::spawn_blocking(move || {
-                        encode_as_jpeg(&rgb_data, width, height)
+                        encode_as_jpeg_turbo(&rgb_data, width, height, 85)
                     }).await {
                         Ok(Ok(data)) => data,
                         Ok(Err(e)) => {
@@ -324,15 +327,20 @@ fn run_camera_capture(
     }
 }
 
-fn encode_as_jpeg(rgb_data: &[u8], width: u32, height: u32) -> Result<Vec<u8>, image::ImageError> {
-    let img: image::RgbImage = ImageBuffer::from_raw(width, height, rgb_data.to_vec())
-        .expect("Invalid buffer size");
+fn encode_as_jpeg_turbo(rgb_data: &[u8], width: u32, height: u32, quality: i32) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+    let mut compressor = Compressor::new()?;
+    compressor.set_quality(quality)?;
+    compressor.set_subsamp(Subsamp::Sub2x2)?;
 
-    let mut jpeg_data = Vec::new();
-    let mut cursor = std::io::Cursor::new(&mut jpeg_data);
+    let image = Image {
+        pixels: rgb_data,
+        width: width as usize,
+        height: height as usize,
+        pitch: (width * 3) as usize,
+        format: TJPixelFormat::RGB,
+    };
 
-    img.write_to(&mut cursor, image::ImageFormat::Jpeg)?;
-
+    let jpeg_data = compressor.compress_to_vec(image)?;
     Ok(jpeg_data)
 }
 
