@@ -108,55 +108,89 @@ async fn run_websocket_server(addr: &str, frame_buffer: SharedFrameBuffer) -> co
 
     while let Ok((stream, addr)) = listener.accept().await {
         tracing::info!("New WebSocket connection from: {}", addr);
+        tracing::debug!("Client address details: {:?}, local address: {:?}", addr, stream.local_addr());
         let frame_buffer = frame_buffer.clone();
-        tokio::spawn(handle_client(stream, frame_buffer));
+        tokio::spawn(handle_client(stream, frame_buffer, addr));
     }
 
     Ok(())
 }
 
-async fn handle_client(stream: TcpStream, frame_buffer: SharedFrameBuffer) {
+async fn handle_client(stream: TcpStream, frame_buffer: SharedFrameBuffer, client_addr: std::net::SocketAddr) {
+    tracing::debug!("Starting WebSocket handshake with client: {}", client_addr);
     let ws_stream = match accept_async(stream).await {
-        Ok(ws) => ws,
+        Ok(ws) => {
+            tracing::debug!("WebSocket handshake successful with: {}", client_addr);
+            ws
+        },
         Err(e) => {
-            tracing::error!("Error during WebSocket handshake: {}", e);
+            tracing::error!("Error during WebSocket handshake with {}: {}", client_addr, e);
             return;
         }
     };
 
     let (mut write, mut read) = ws_stream.split();
+    tracing::debug!("WebSocket connection established with {}, waiting for messages", client_addr);
 
     while let Some(msg) = read.next().await {
         match msg {
             Ok(Message::Text(text)) => {
+                tracing::debug!("Received text message from {}: {:?}", client_addr, text);
                 if text.trim() == "s" {
-                    tracing::debug!("Received 's' command, sending latest frame");
+                    tracing::debug!("Received 's' command from {}, sending latest frame", client_addr);
 
                     match frame_buffer.get_png() {
                         Some(png_data) => {
+                            let data_size = png_data.len();
+                            tracing::debug!("Encoding PNG for client {}: {} bytes", client_addr, data_size);
+                            
+                            let send_start = std::time::Instant::now();
                             if let Err(e) = write.send(Message::Binary(png_data.into())).await {
-                                tracing::error!("Error sending frame: {}", e);
+                                tracing::error!("Error sending frame to {}: {}", client_addr, e);
                                 break;
                             }
+                            let send_duration = send_start.elapsed();
+                            tracing::debug!(
+                                "Frame sent to {} successfully: {} bytes in {:?} ({:.2} MB/s)",
+                                client_addr,
+                                data_size,
+                                send_duration,
+                                data_size as f64 / send_duration.as_secs_f64() / 1_000_000.0
+                            );
                         }
                         None => {
-                            tracing::warn!("No frame available yet");
+                            tracing::warn!("No frame available yet for client {}", client_addr);
                             continue;
                         }
                     }
+                } else {
+                    tracing::debug!("Received unknown command from {}: {:?}", client_addr, text);
                 }
             }
-            Ok(Message::Close(_)) => {
-                tracing::info!("Client disconnected");
+            Ok(Message::Close(frame)) => {
+                tracing::info!("Client {} disconnected: {:?}", client_addr, frame);
                 break;
+            }
+            Ok(Message::Ping(data)) => {
+                tracing::debug!("Received ping from {}: {} bytes", client_addr, data.len());
+            }
+            Ok(Message::Pong(data)) => {
+                tracing::debug!("Received pong from {}: {} bytes", client_addr, data.len());
+            }
+            Ok(Message::Binary(data)) => {
+                tracing::debug!("Received binary message from {}: {} bytes", client_addr, data.len());
+            }
+            Ok(Message::Frame(_)) => {
+                tracing::debug!("Received raw frame from {}", client_addr);
             }
             Err(e) => {
-                tracing::error!("WebSocket error: {}", e);
+                tracing::error!("WebSocket error with {}: {}", client_addr, e);
                 break;
             }
-            _ => {}
         }
     }
+    
+    tracing::debug!("Connection handler for {} terminated", client_addr);
 }
 
 fn run_camera_capture(
