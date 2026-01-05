@@ -38,7 +38,7 @@ pub struct Flags {
     pub name: Option<String>,
     #[arg(long)]
     pub format: Option<String>,
-    #[arg(long, default_value = "127.0.0.1:8080")]
+    #[arg(long, default_value = "0.0.0.0:8080")]
     pub websocket_address: String,
 }
 
