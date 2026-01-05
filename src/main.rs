@@ -3,7 +3,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use clap::Parser;
 use color_eyre::eyre::Context;
-use image::{ImageBuffer, ImageEncoder, RgbaImage};
+use image::{ImageBuffer, ImageEncoder};
 use libcamera::camera_manager::CameraManager;
 use libcamera::*;
 use libcamera::camera::{Camera, CameraConfiguration, CameraConfigurationStatus};
@@ -58,7 +58,6 @@ impl SharedFrameBuffer {
         *data = Some(frame_data.to_vec());
     }
 
-    // Changed: Now returns raw RGBA data instead of encoding to PNG
     fn get_rgb(&self) -> Option<Vec<u8>> {
         let data = self.data.lock().unwrap();
         data.clone()
@@ -132,7 +131,6 @@ async fn handle_client(stream: TcpStream, frame_buffer: SharedFrameBuffer, clien
                 if text.trim() == "s" {
                     tracing::debug!("Received 's' command from {}, sending latest frame", client_addr);
 
-                    // Get raw RGBA data
                     let rgb_data = match frame_buffer.get_rgb() {
                         Some(data) => data,
                         None => {
