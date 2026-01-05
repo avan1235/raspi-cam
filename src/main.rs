@@ -1,8 +1,9 @@
-use std::ops::Deref;
+use std::ops::{Deref, DerefMut};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use clap::Parser;
 use color_eyre::eyre::Context;
+use image::{ImageBuffer, ImageEncoder};
 use libcamera::camera_manager::CameraManager;
 use libcamera::*;
 use libcamera::camera::{Camera, CameraConfiguration, CameraConfigurationStatus};
@@ -34,7 +35,7 @@ pub struct Flags {
     pub height: u32,
     #[arg(long, default_value = "0.0.0.0:8080")]
     pub websocket_address: String,
-    #[arg(long, default_value_t = 60)]
+    #[arg(long, default_value_t = 85)]
     pub jpeg_quality: i32,
 }
 
@@ -326,21 +327,33 @@ fn run_camera_capture(
     }
 }
 
+thread_local! {
+    static COMPRESSOR: std::cell::RefCell<Option<Compressor>> = std::cell::RefCell::new(None);
+}
+
 fn encode_as_jpeg_turbo(rgb_data: &[u8], width: u32, height: u32, quality: i32) -> Result<Vec<u8>, String> {
-    let mut compressor = Compressor::new().map_err(|e| e.to_string())?;
-    compressor.set_quality(quality).map_err(|e| e.to_string())?;
-    compressor.set_subsamp(Subsamp::Sub2x2).map_err(|e| e.to_string())?;
+    COMPRESSOR.with(|comp_cell| {
+        let mut comp_opt = comp_cell.borrow_mut();
 
-    let image = Image {
-        pixels: rgb_data,
-        width: width as usize,
-        height: height as usize,
-        pitch: (width * 3) as usize,
-        format: TJPixelFormat::RGB,
-    };
+        if comp_opt.is_none() {
+            let mut compressor = Compressor::new().map_err(|e| e.to_string())?;
+            compressor.set_quality(quality).map_err(|e| e.to_string())?;
+            compressor.set_subsamp(Subsamp::Sub2x2).map_err(|e| e.to_string())?;
+            *comp_opt = Some(compressor);
+        }
 
-    let jpeg_data = compressor.compress_to_vec(image).map_err(|e| e.to_string())?;
-    Ok(jpeg_data)
+        let compressor = comp_opt.as_mut().unwrap();
+
+        let image = Image {
+            pixels: rgb_data,
+            width: width as usize,
+            height: height as usize,
+            pitch: (width * 3) as usize,
+            format: TJPixelFormat::RGB,
+        };
+
+        compressor.compress_to_vec(image).map_err(|e| e.to_string())
+    })
 }
 
 trait CameraStream {
