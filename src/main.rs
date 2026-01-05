@@ -329,14 +329,9 @@ fn encode_as_jpeg(rgb_data: &[u8], width: u32, height: u32) -> Result<Vec<u8>, i
         .expect("Invalid buffer size");
 
     let mut jpeg_data = Vec::new();
+    let mut cursor = std::io::Cursor::new(&mut jpeg_data);
 
-    let mut encoder = image::codecs::jpeg::JpegEncoder::new_with_quality(&mut jpeg_data, 60);
-    encoder.encode(
-        img.as_raw(),
-        width,
-        height,
-        image::ExtendedColorType::Rgb8
-    )?;
+    img.write_to(&mut cursor, image::ImageFormat::Jpeg)?;
 
     Ok(jpeg_data)
 }
