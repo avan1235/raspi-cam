@@ -59,7 +59,7 @@ impl SharedFrameBuffer {
     }
 
     // Changed: Now returns raw RGBA data instead of encoding to PNG
-    fn get_rgba(&self) -> Option<Vec<u8>> {
+    fn get_rgb(&self) -> Option<Vec<u8>> {
         let data = self.data.lock().unwrap();
         data.clone()
     }
@@ -133,7 +133,7 @@ async fn handle_client(stream: TcpStream, frame_buffer: SharedFrameBuffer, clien
                     tracing::debug!("Received 's' command from {}, sending latest frame", client_addr);
 
                     // Get raw RGBA data
-                    let rgba_data = match frame_buffer.get_rgba() {
+                    let rgb_data = match frame_buffer.get_rgb() {
                         Some(data) => data,
                         None => {
                             tracing::warn!("No frame available yet for client {}", client_addr);
@@ -147,7 +147,7 @@ async fn handle_client(stream: TcpStream, frame_buffer: SharedFrameBuffer, clien
                     // Move JPEG encoding to blocking thread pool
                     let encode_start = std::time::Instant::now();
                     let jpeg_data = match tokio::task::spawn_blocking(move || {
-                        encode_as_jpeg(&rgba_data, width, height)
+                        encode_as_jpeg(&rgb_data, width, height)
                     }).await {
                         Ok(Ok(data)) => data,
                         Ok(Err(e)) => {
@@ -326,20 +326,13 @@ fn run_camera_capture(
     }
 }
 
-fn encode_as_jpeg(rgba_data: &[u8], width: u32, height: u32) -> Result<Vec<u8>, image::ImageError> {
-    // Convert RGBA to RGB (strip alpha channel)
-    let rgb_data: Vec<u8> = rgba_data
-        .chunks_exact(4)
-        .flat_map(|pixel| [pixel[0], pixel[1], pixel[2]])
-        .collect();
-
-    let img: image::RgbaImage = ImageBuffer::from_raw(width, height, rgb_data)
+fn encode_as_jpeg(rgb_data: &[u8], width: u32, height: u32) -> Result<Vec<u8>, image::ImageError> {
+    let img: image::RgbImage = ImageBuffer::from_raw(width, height, rgb_data.to_vec())
         .expect("Invalid buffer size");
 
     let mut jpeg_data = Vec::new();
     let mut cursor = std::io::Cursor::new(&mut jpeg_data);
 
-    // Use JPEG with quality 85 (good balance of quality and speed)
     img.write_to(&mut cursor, image::ImageFormat::Jpeg)?;
 
     Ok(jpeg_data)
