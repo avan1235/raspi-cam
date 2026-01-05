@@ -16,10 +16,6 @@ tokio-tungstenite = "0.28"
 tungstenite = "0.28"
 futures-util = "0.3"
 
-[target.aarch64-unknown-linux-gnu]
-linker = "clang"
-rustflags = ["-C", "link-arg=-fuse-ld=lld"]
-
 [profile.release]
 lto = false
 debug = 0
