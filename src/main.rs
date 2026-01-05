@@ -29,9 +29,9 @@ mod buffer;
 #[derive(Debug, Clone, Parser)]
 #[command(version)]
 pub struct Flags {
-    #[arg(long, default_value_t = 1920)]
+    #[arg(long, default_value_t = 640)]
     pub width: u32,
-    #[arg(long, default_value_t = 1080)]
+    #[arg(long, default_value_t = 360)]
     pub height: u32,
     #[arg(long, default_value = "0.0.0.0:8080")]
     pub websocket_address: String,
