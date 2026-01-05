@@ -3,7 +3,7 @@ use libcamera::camera::{Camera, CameraConfiguration};
 use libcamera::color_space::Range;
 use libcamera::pixel_format::PixelFormat;
 use libcamera::stream::StreamConfigurationRef;
-use yuvutils_rs::{yuyv422_to_rgb, yuyv422_to_rgba, YuvPackedImage, YuvRange, YuvStandardMatrix};
+use yuvutils_rs::{yuyv422_to_rgb, YuvPackedImage, YuvRange, YuvStandardMatrix};
 use super::{supports_configuration, CameraStream};
 
 pub struct YuyvStream;

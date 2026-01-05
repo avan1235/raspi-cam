@@ -1,9 +1,8 @@
-use std::ops::{Deref, DerefMut};
+use std::ops::Deref;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use clap::Parser;
 use color_eyre::eyre::Context;
-use image::{ImageBuffer, ImageEncoder};
 use libcamera::camera_manager::CameraManager;
 use libcamera::*;
 use libcamera::camera::{Camera, CameraConfiguration, CameraConfigurationStatus};
