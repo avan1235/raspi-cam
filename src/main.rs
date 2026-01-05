@@ -58,11 +58,10 @@ impl SharedFrameBuffer {
         *data = Some(frame_data.to_vec());
     }
 
-    fn get_png(&self) -> Option<Vec<u8>> {
+    // Changed: Now returns raw RGBA data instead of encoding to PNG
+    fn get_rgba(&self) -> Option<Vec<u8>> {
         let data = self.data.lock().unwrap();
-        data.as_ref().and_then(|rgba_data| {
-            encode_as_png(rgba_data, self.width, self.height).ok()
-        })
+        data.clone()
     }
 }
 
@@ -133,30 +132,55 @@ async fn handle_client(stream: TcpStream, frame_buffer: SharedFrameBuffer, clien
                 if text.trim() == "s" {
                     tracing::debug!("Received 's' command from {}, sending latest frame", client_addr);
 
-                    match frame_buffer.get_png() {
-                        Some(png_data) => {
-                            let data_size = png_data.len();
-                            tracing::debug!("Encoding PNG for client {}: {} bytes", client_addr, data_size);
-                            
-                            let send_start = std::time::Instant::now();
-                            if let Err(e) = write.send(Message::Binary(png_data.into())).await {
-                                tracing::error!("Error sending frame to {}: {}", client_addr, e);
-                                break;
-                            }
-                            let send_duration = send_start.elapsed();
-                            tracing::debug!(
-                                "Frame sent to {} successfully: {} bytes in {:?} ({:.2} MB/s)",
-                                client_addr,
-                                data_size,
-                                send_duration,
-                                data_size as f64 / send_duration.as_secs_f64() / 1_000_000.0
-                            );
-                        }
+                    // Get raw RGBA data
+                    let rgba_data = match frame_buffer.get_rgba() {
+                        Some(data) => data,
                         None => {
                             tracing::warn!("No frame available yet for client {}", client_addr);
                             continue;
                         }
+                    };
+
+                    let width = frame_buffer.width;
+                    let height = frame_buffer.height;
+
+                    // Move PNG encoding to blocking thread pool
+                    let encode_start = std::time::Instant::now();
+                    let jpeg_data = match tokio::task::spawn_blocking(move || {
+                        encode_as_jpeg(&rgba_data, width, height)
+                    }).await {
+                        Ok(Ok(data)) => data,
+                        Ok(Err(e)) => {
+                            tracing::error!("PNG encoding error for client {}: {}", client_addr, e);
+                            continue;
+                        }
+                        Err(e) => {
+                            tracing::error!("Task join error for client {}: {}", client_addr, e);
+                            continue;
+                        }
+                    };
+
+                    let encode_duration = encode_start.elapsed();
+                    tracing::debug!(
+                        "PNG encoding completed for {}: {} bytes in {:?}",
+                        client_addr,
+                        jpeg_data.len(),
+                        encode_duration
+                    );
+
+                    let send_start = std::time::Instant::now();
+                    if let Err(e) = write.send(Message::Binary(jpeg_data.as_ref().into())).await {
+                        tracing::error!("Error sending frame to {}: {}", client_addr, e);
+                        break;
                     }
+                    let send_duration = send_start.elapsed();
+                    tracing::debug!(
+                        "Frame sent to {} successfully: {} bytes in {:?} ({:.2} MB/s)",
+                        client_addr,
+                        jpeg_data.len(),
+                        send_duration,
+                        jpeg_data.len() as f64 / send_duration.as_secs_f64() / 1_000_000.0
+                    );
                 } else {
                     tracing::debug!("Received unknown command from {}: {:?}", client_addr, text);
                 }
@@ -183,7 +207,7 @@ async fn handle_client(stream: TcpStream, frame_buffer: SharedFrameBuffer, clien
             }
         }
     }
-    
+
     tracing::debug!("Connection handler for {} terminated", client_addr);
 }
 
@@ -301,15 +325,15 @@ fn run_camera_capture(
     }
 }
 
-fn encode_as_png(rgba_data: &[u8], width: u32, height: u32) -> Result<Vec<u8>, image::ImageError> {
+fn encode_as_jpeg(rgba_data: &[u8], width: u32, height: u32) -> Result<Vec<u8>, image::ImageError> {
     let img: RgbaImage = ImageBuffer::from_raw(width, height, rgba_data.to_vec())
         .expect("Invalid buffer size");
 
-    let mut png_data = Vec::new();
-    let mut cursor = std::io::Cursor::new(&mut png_data);
-    img.write_to(&mut cursor, image::ImageFormat::Png)?;
+    let mut jpeg_data = Vec::new();
+    let mut cursor = std::io::Cursor::new(&mut jpeg_data);
+    img.write_to(&mut cursor, image::ImageFormat::Jpeg)?;
 
-    Ok(png_data)
+    Ok(jpeg_data)
 }
 
 trait CameraStream {
