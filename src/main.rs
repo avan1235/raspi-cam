@@ -1,30 +1,30 @@
-use std::ops::{Deref, DerefMut};
-use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use crate::buffer::DoubleBuffer;
 use clap::Parser;
 use color_eyre::eyre::Context;
+use futures_util::{SinkExt, StreamExt};
 use image::{ImageBuffer, ImageEncoder};
-use libcamera::camera_manager::CameraManager;
-use libcamera::*;
 use libcamera::camera::{Camera, CameraConfiguration, CameraConfigurationStatus};
+use libcamera::camera_manager::CameraManager;
 use libcamera::framebuffer::{AsFrameBuffer, FrameMetadataStatus};
 use libcamera::framebuffer_allocator::{FrameBuffer, FrameBufferAllocator};
 use libcamera::framebuffer_map::MemoryMappedFrameBuffer;
 use libcamera::geometry::Size;
 use libcamera::pixel_format::PixelFormat;
-use libcamera::request::{ReuseFlag};
+use libcamera::request::ReuseFlag;
 use libcamera::stream::{StreamConfigurationRef, StreamRole};
-use tracing_subscriber::fmt;
-use tracing_subscriber::prelude::*;
-use tracing_subscriber::EnvFilter;
+use libcamera::*;
+use std::ops::{Deref, DerefMut};
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
 use tokio::net::{TcpListener, TcpStream};
 use tokio_tungstenite::{accept_async, tungstenite::Message};
-use futures_util::{StreamExt, SinkExt};
+use tracing_subscriber::EnvFilter;
+use tracing_subscriber::fmt;
+use tracing_subscriber::prelude::*;
 use turbojpeg::{Compressor, Image, PixelFormat as TJPixelFormat, Subsamp};
-use crate::buffer::DoubleBuffer;
 
-mod yuyv;
 mod buffer;
+mod yuyv;
 
 const WIDTH: u32 = 1920;
 const HEIGHT: u32 = 1080;
@@ -80,18 +80,26 @@ async fn main() -> color_eyre::Result<()> {
         if let Err(e) = run_camera_capture(frame_buffer) {
             tracing::error!("Camera capture error: {}", e);
         }
-    }).await?;
+    })
+    .await?;
 
     Ok(())
 }
 
-async fn run_websocket_server(addr: &str, frame_buffer: SharedFrameBuffer) -> color_eyre::Result<()> {
+async fn run_websocket_server(
+    addr: &str,
+    frame_buffer: SharedFrameBuffer,
+) -> color_eyre::Result<()> {
     let listener = TcpListener::bind(addr).await?;
     tracing::info!("WebSocket server listening on: {}", addr);
 
     while let Ok((stream, addr)) = listener.accept().await {
         tracing::info!("New WebSocket connection from: {}", addr);
-        tracing::debug!("Client address details: {:?}, local address: {:?}", addr, stream.local_addr());
+        tracing::debug!(
+            "Client address details: {:?}, local address: {:?}",
+            addr,
+            stream.local_addr()
+        );
         let frame_buffer = frame_buffer.clone();
         tokio::spawn(handle_client(stream, frame_buffer, addr));
     }
@@ -99,28 +107,42 @@ async fn run_websocket_server(addr: &str, frame_buffer: SharedFrameBuffer) -> co
     Ok(())
 }
 
-async fn handle_client(stream: TcpStream, frame_buffer: SharedFrameBuffer, client_addr: std::net::SocketAddr) {
+async fn handle_client(
+    stream: TcpStream,
+    frame_buffer: SharedFrameBuffer,
+    client_addr: std::net::SocketAddr,
+) {
     tracing::debug!("Starting WebSocket handshake with client: {}", client_addr);
     let ws_stream = match accept_async(stream).await {
         Ok(ws) => {
             tracing::debug!("WebSocket handshake successful with: {}", client_addr);
             ws
-        },
+        }
         Err(e) => {
-            tracing::error!("Error during WebSocket handshake with {}: {}", client_addr, e);
+            tracing::error!(
+                "Error during WebSocket handshake with {}: {}",
+                client_addr,
+                e
+            );
             return;
         }
     };
 
     let (mut write, mut read) = ws_stream.split();
-    tracing::debug!("WebSocket connection established with {}, waiting for messages", client_addr);
+    tracing::debug!(
+        "WebSocket connection established with {}, waiting for messages",
+        client_addr
+    );
 
     while let Some(msg) = read.next().await {
         match msg {
             Ok(Message::Text(text)) => {
                 tracing::debug!("Received text message from {}: {:?}", client_addr, text);
                 if text.trim() == "s" {
-                    tracing::debug!("Received 's' command from {}, sending latest frame", client_addr);
+                    tracing::debug!(
+                        "Received 's' command from {}, sending latest frame",
+                        client_addr
+                    );
 
                     let rgb_data = match frame_buffer.get_rgb() {
                         Some(data) => data,
@@ -137,10 +159,16 @@ async fn handle_client(stream: TcpStream, frame_buffer: SharedFrameBuffer, clien
                     let encode_start = std::time::Instant::now();
                     let jpeg_data = match tokio::task::spawn_blocking(move || {
                         encode_as_jpeg_turbo(&rgb_data, width, height, 85)
-                    }).await {
+                    })
+                    .await
+                    {
                         Ok(Ok(data)) => data,
                         Ok(Err(e)) => {
-                            tracing::error!("JPEG encoding error for client {}: {}", client_addr, e);
+                            tracing::error!(
+                                "JPEG encoding error for client {}: {}",
+                                client_addr,
+                                e
+                            );
                             continue;
                         }
                         Err(e) => {
@@ -186,7 +214,11 @@ async fn handle_client(stream: TcpStream, frame_buffer: SharedFrameBuffer, clien
                 tracing::debug!("Received pong from {}: {} bytes", client_addr, data.len());
             }
             Ok(Message::Binary(data)) => {
-                tracing::debug!("Received binary message from {}: {} bytes", client_addr, data.len());
+                tracing::debug!(
+                    "Received binary message from {}: {} bytes",
+                    client_addr,
+                    data.len()
+                );
             }
             Ok(Message::Frame(_)) => {
                 tracing::debug!("Received raw frame from {}", client_addr);
@@ -201,9 +233,7 @@ async fn handle_client(stream: TcpStream, frame_buffer: SharedFrameBuffer, clien
     tracing::debug!("Connection handler for {} terminated", client_addr);
 }
 
-fn run_camera_capture(
-    frame_buffer: SharedFrameBuffer,
-) -> color_eyre::Result<()> {
+fn run_camera_capture(frame_buffer: SharedFrameBuffer) -> color_eyre::Result<()> {
     let camera_manager = CameraManager::new()?;
     let cameras = camera_manager.cameras();
 
@@ -217,7 +247,9 @@ fn run_camera_capture(
     let mut cam = cam.acquire()?;
 
     let stream_formats = vec![yuyv::YuyvStream];
-    let camera_stream = stream_formats.into_iter().find_map(|stream| stream.is_supported(&cam).map(|cfg| (stream, cfg)));
+    let camera_stream = stream_formats
+        .into_iter()
+        .find_map(|stream| stream.is_supported(&cam).map(|cfg| (stream, cfg)));
 
     let Some((camera_stream, mut cfg)) = camera_stream else {
         color_eyre::eyre::bail!("No supported stream format found");
@@ -226,12 +258,17 @@ fn run_camera_capture(
     cfg.get_mut(0).unwrap().set_size(Size::new(WIDTH, HEIGHT));
 
     match cfg.validate() {
-        CameraConfigurationStatus::Adjusted => tracing::warn!("Camera configuration was adjusted after changing frame size: {cfg:#?}"),
-        CameraConfigurationStatus::Invalid => color_eyre::eyre::bail!("Error validating camera configuration after changing frame_size"),
+        CameraConfigurationStatus::Adjusted => {
+            tracing::warn!("Camera configuration was adjusted after changing frame size: {cfg:#?}")
+        }
+        CameraConfigurationStatus::Invalid => color_eyre::eyre::bail!(
+            "Error validating camera configuration after changing frame_size"
+        ),
         _ => {}
     }
 
-    cam.configure(&mut cfg).context("Unable to configure camera")?;
+    cam.configure(&mut cfg)
+        .context("Unable to configure camera")?;
 
     let mut alloc = FrameBufferAllocator::new(&cam);
 
@@ -289,7 +326,13 @@ fn run_camera_capture(
                 cam.queue_request(req).map_err(|(_, e)| e)?;
                 continue;
             }
-            let bytes_used = framebuffer.metadata().unwrap().planes().get(0).unwrap().bytes_used as usize;
+            let bytes_used = framebuffer
+                .metadata()
+                .unwrap()
+                .planes()
+                .get(0)
+                .unwrap()
+                .bytes_used as usize;
 
             let planes = framebuffer.data();
             tracing::trace!("Data Planes: {:?}", planes.len());
@@ -318,14 +361,21 @@ thread_local! {
     static COMPRESSOR: std::cell::RefCell<Option<Compressor>> = std::cell::RefCell::new(None);
 }
 
-fn encode_as_jpeg_turbo(rgb_data: &[u8], width: u32, height: u32, quality: i32) -> Result<Vec<u8>, String> {
+fn encode_as_jpeg_turbo(
+    rgb_data: &[u8],
+    width: u32,
+    height: u32,
+    quality: i32,
+) -> Result<Vec<u8>, String> {
     COMPRESSOR.with(|comp_cell| {
         let mut comp_opt = comp_cell.borrow_mut();
 
         if comp_opt.is_none() {
             let mut compressor = Compressor::new().map_err(|e| e.to_string())?;
             compressor.set_quality(quality).map_err(|e| e.to_string())?;
-            compressor.set_subsamp(Subsamp::Sub2x2).map_err(|e| e.to_string())?;
+            compressor
+                .set_subsamp(Subsamp::Sub2x2)
+                .map_err(|e| e.to_string())?;
             *comp_opt = Some(compressor);
         }
 
@@ -346,7 +396,12 @@ fn encode_as_jpeg_turbo(rgb_data: &[u8], width: u32, height: u32, quality: i32) 
 trait CameraStream {
     fn name(&self) -> &'static str;
     fn is_supported(&self, camera: &Camera) -> Option<CameraConfiguration>;
-    fn convert_frame(&self, configuration: &StreamConfigurationRef, data: &[u8], target_buffer: &mut [u8]) -> color_eyre::Result<()>;
+    fn convert_frame(
+        &self,
+        configuration: &StreamConfigurationRef,
+        data: &[u8],
+        target_buffer: &mut [u8],
+    ) -> color_eyre::Result<()>;
 }
 
 fn supports_configuration(cam: &Camera, format: PixelFormat) -> Option<CameraConfiguration> {
@@ -357,8 +412,12 @@ fn supports_configuration(cam: &Camera, format: PixelFormat) -> Option<CameraCon
 
     match cfgs.validate() {
         CameraConfigurationStatus::Valid => tracing::debug!("Camera configuration {format} valid!"),
-        CameraConfigurationStatus::Adjusted => tracing::trace!("Camera configuration was adjusted: {cfgs:#?}"),
-        CameraConfigurationStatus::Invalid => tracing::trace!("Error validating camera configuration for {format}"),
+        CameraConfigurationStatus::Adjusted => {
+            tracing::trace!("Camera configuration was adjusted: {cfgs:#?}")
+        }
+        CameraConfigurationStatus::Invalid => {
+            tracing::trace!("Error validating camera configuration for {format}")
+        }
     }
 
     if cfgs.get(0).unwrap().get_pixel_format() != format {
