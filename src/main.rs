@@ -26,18 +26,10 @@ use crate::buffer::DoubleBuffer;
 mod yuyv;
 mod buffer;
 
-#[derive(Debug, Clone, Parser)]
-#[command(version)]
-pub struct Flags {
-    #[arg(long, default_value_t = 640)]
-    pub width: u32,
-    #[arg(long, default_value_t = 360)]
-    pub height: u32,
-    #[arg(long, default_value = "0.0.0.0:8080")]
-    pub websocket_address: String,
-    #[arg(long, default_value_t = 85)]
-    pub jpeg_quality: i32,
-}
+const WIDTH: u32 = 1920;
+const HEIGHT: u32 = 1080;
+const WEBSOCKET_ADDRESS: &str = "0.0.0.0:8080";
+const JPEG_QUALITY: i32 = 85;
 
 // Shared state for the latest frame
 #[derive(Clone)]
@@ -69,27 +61,23 @@ impl SharedFrameBuffer {
 
 #[tokio::main]
 async fn main() -> color_eyre::Result<()> {
-    let flags = Flags::parse();
     tracing_subscriber::registry()
         .with(fmt::layer())
         .with(EnvFilter::from_default_env())
         .init();
 
-    let frame_buffer = SharedFrameBuffer::new(flags.width, flags.height);
+    let frame_buffer = SharedFrameBuffer::new(WIDTH, HEIGHT);
 
     // Start WebSocket server
-    let ws_addr = flags.websocket_address.clone();
     let frame_buffer_ws = frame_buffer.clone();
     tokio::spawn(async move {
-        if let Err(e) = run_websocket_server(&ws_addr, frame_buffer_ws).await {
+        if let Err(e) = run_websocket_server(&WEBSOCKET_ADDRESS, frame_buffer_ws).await {
             tracing::error!("WebSocket server error: {}", e);
         }
     });
 
-    // Run camera capture in blocking thread
-    let flags_clone = flags.clone();
     tokio::task::spawn_blocking(move || {
-        if let Err(e) = run_camera_capture(flags_clone, frame_buffer) {
+        if let Err(e) = run_camera_capture(frame_buffer) {
             tracing::error!("Camera capture error: {}", e);
         }
     }).await?;
@@ -214,7 +202,6 @@ async fn handle_client(stream: TcpStream, frame_buffer: SharedFrameBuffer, clien
 }
 
 fn run_camera_capture(
-    flags: Flags,
     frame_buffer: SharedFrameBuffer,
 ) -> color_eyre::Result<()> {
     let camera_manager = CameraManager::new()?;
@@ -236,7 +223,7 @@ fn run_camera_capture(
         color_eyre::eyre::bail!("No supported stream format found");
     };
 
-    cfg.get_mut(0).unwrap().set_size(Size::new(flags.width, flags.height));
+    cfg.get_mut(0).unwrap().set_size(Size::new(WIDTH, HEIGHT));
 
     match cfg.validate() {
         CameraConfigurationStatus::Adjusted => tracing::warn!("Camera configuration was adjusted after changing frame size: {cfg:#?}"),
