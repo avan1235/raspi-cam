@@ -31,8 +31,8 @@ const CAPTURE_WIDTH: u32 = 1920;
 const CAPTURE_HEIGHT: u32 = 1080;
 
 // Output resolution (720p) - optimized for Pi 3B network bandwidth
-const OUTPUT_WIDTH: u32 = 1280;
-const OUTPUT_HEIGHT: u32 = 720;
+const OUTPUT_WIDTH: u32 = 640;
+const OUTPUT_HEIGHT: u32 = 360;
 
 const WEBSOCKET_ADDRESS: &str = "0.0.0.0:8080";
 
@@ -118,99 +118,6 @@ fn scale_rgb_bilinear(
                 let value = (top * y_inv + bottom * y_frac) >> 16;
 
                 dst[dst_row + (dst_x as usize) * 3 + c] = value as u8;
-            }
-        }
-    }
-
-    dst
-}
-
-/// Faster nearest-neighbor scaling - use this if bilinear is too slow on Pi 3B
-#[allow(dead_code)]
-fn scale_rgb_nearest(
-    src: &[u8],
-    src_width: u32,
-    src_height: u32,
-    dst_width: u32,
-    dst_height: u32,
-) -> Vec<u8> {
-    let mut dst = vec![0u8; (dst_width * dst_height * 3) as usize];
-
-    let x_ratio = (src_width << 16) / dst_width;
-    let y_ratio = (src_height << 16) / dst_height;
-
-    let src_stride = (src_width * 3) as usize;
-    let dst_stride = (dst_width * 3) as usize;
-
-    for dst_y in 0..dst_height {
-        let src_y = ((dst_y * y_ratio) >> 16) as usize;
-        let src_row = src_y * src_stride;
-        let dst_row = (dst_y as usize) * dst_stride;
-
-        for dst_x in 0..dst_width {
-            let src_x = ((dst_x * x_ratio) >> 16) as usize;
-            let src_offset = src_row + src_x * 3;
-            let dst_offset = dst_row + (dst_x as usize) * 3;
-
-            dst[dst_offset] = src[src_offset];
-            dst[dst_offset + 1] = src[src_offset + 1];
-            dst[dst_offset + 2] = src[src_offset + 2];
-        }
-    }
-
-    dst
-}
-
-/// Box filter scaling - good balance between speed and quality for downscaling
-/// Particularly effective for 2:1 or similar scale factors
-fn scale_rgb_box(
-    src: &[u8],
-    src_width: u32,
-    src_height: u32,
-    dst_width: u32,
-    dst_height: u32,
-) -> Vec<u8> {
-    let mut dst = vec![0u8; (dst_width * dst_height * 3) as usize];
-
-    let x_scale = src_width as f32 / dst_width as f32;
-    let y_scale = src_height as f32 / dst_height as f32;
-
-    let src_stride = (src_width * 3) as usize;
-    let dst_stride = (dst_width * 3) as usize;
-
-    for dst_y in 0..dst_height {
-        let src_y_start = (dst_y as f32 * y_scale) as u32;
-        let src_y_end = ((dst_y + 1) as f32 * y_scale).ceil() as u32;
-        let src_y_end = src_y_end.min(src_height);
-
-        let dst_row = (dst_y as usize) * dst_stride;
-
-        for dst_x in 0..dst_width {
-            let src_x_start = (dst_x as f32 * x_scale) as u32;
-            let src_x_end = ((dst_x + 1) as f32 * x_scale).ceil() as u32;
-            let src_x_end = src_x_end.min(src_width);
-
-            let mut sum_r: u32 = 0;
-            let mut sum_g: u32 = 0;
-            let mut sum_b: u32 = 0;
-            let mut count: u32 = 0;
-
-            for src_y in src_y_start..src_y_end {
-                let src_row = (src_y as usize) * src_stride;
-                for src_x in src_x_start..src_x_end {
-                    let src_offset = src_row + (src_x as usize) * 3;
-                    sum_r += src[src_offset] as u32;
-                    sum_g += src[src_offset + 1] as u32;
-                    sum_b += src[src_offset + 2] as u32;
-                    count += 1;
-                }
-            }
-
-            let dst_offset = dst_row + (dst_x as usize) * 3;
-            if count > 0 {
-                dst[dst_offset] = (sum_r / count) as u8;
-                dst[dst_offset + 1] = (sum_g / count) as u8;
-                dst[dst_offset + 2] = (sum_b / count) as u8;
             }
         }
     }
