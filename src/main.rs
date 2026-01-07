@@ -1,6 +1,8 @@
 use crate::buffer::DoubleBuffer;
+use clap::Parser;
 use color_eyre::eyre::Context;
 use futures_util::{SinkExt, StreamExt};
+use image::{ImageBuffer, ImageEncoder};
 use libcamera::camera::{Camera, CameraConfiguration, CameraConfigurationStatus};
 use libcamera::camera_manager::CameraManager;
 use libcamera::framebuffer::{AsFrameBuffer, FrameMetadataStatus};
@@ -11,9 +13,8 @@ use libcamera::pixel_format::PixelFormat;
 use libcamera::request::ReuseFlag;
 use libcamera::stream::{StreamConfigurationRef, StreamRole};
 use libcamera::*;
-use std::ops::Deref;
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Condvar, Mutex};
+use std::ops::{Deref, DerefMut};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::net::{TcpListener, TcpStream};
 use tokio_tungstenite::{accept_async, tungstenite::Message};
@@ -29,76 +30,6 @@ const WIDTH: u32 = 1920;
 const HEIGHT: u32 = 1080;
 const WEBSOCKET_ADDRESS: &str = "0.0.0.0:8080";
 const JPEG_QUALITY: i32 = 85;
-
-/// Tracks the number of connected clients and signals when clients connect/disconnect
-#[derive(Clone)]
-struct ClientCounter {
-    inner: Arc<ClientCounterInner>,
-}
-
-struct ClientCounterInner {
-    count: AtomicUsize,
-    condvar: Condvar,
-    mutex: Mutex<()>,
-}
-
-impl ClientCounter {
-    fn new() -> Self {
-        Self {
-            inner: Arc::new(ClientCounterInner {
-                count: AtomicUsize::new(0),
-                condvar: Condvar::new(),
-                mutex: Mutex::new(()),
-            }),
-        }
-    }
-
-    fn increment(&self) {
-        let old_count = self.inner.count.fetch_add(1, Ordering::SeqCst);
-        if old_count == 0 {
-            // First client connected, wake up the camera thread
-            self.inner.condvar.notify_all();
-        }
-        tracing::debug!("Client connected, total clients: {}", old_count + 1);
-    }
-
-    fn decrement(&self) {
-        let old_count = self.inner.count.fetch_sub(1, Ordering::SeqCst);
-        tracing::debug!("Client disconnected, total clients: {}", old_count - 1);
-    }
-
-    fn has_clients(&self) -> bool {
-        self.inner.count.load(Ordering::SeqCst) > 0
-    }
-
-    /// Blocks until at least one client is connected
-    fn wait_for_clients(&self) {
-        let guard = self.inner.mutex.lock().unwrap();
-        let _guard = self
-            .inner
-            .condvar
-            .wait_while(guard, |_| !self.has_clients())
-            .unwrap();
-    }
-}
-
-/// RAII guard that decrements the client count when dropped
-struct ClientGuard {
-    counter: ClientCounter,
-}
-
-impl ClientGuard {
-    fn new(counter: ClientCounter) -> Self {
-        counter.increment();
-        Self { counter }
-    }
-}
-
-impl Drop for ClientGuard {
-    fn drop(&mut self) {
-        self.counter.decrement();
-    }
-}
 
 // Shared state for the latest frame
 #[derive(Clone)]
@@ -126,11 +57,6 @@ impl SharedFrameBuffer {
         let data = self.data.lock().unwrap();
         data.clone()
     }
-
-    fn clear(&self) {
-        let mut data = self.data.lock().unwrap();
-        *data = None;
-    }
 }
 
 #[tokio::main]
@@ -141,26 +67,21 @@ async fn main() -> color_eyre::Result<()> {
         .init();
 
     let frame_buffer = SharedFrameBuffer::new(WIDTH, HEIGHT);
-    let client_counter = ClientCounter::new();
 
     // Start WebSocket server
     let frame_buffer_ws = frame_buffer.clone();
-    let client_counter_ws = client_counter.clone();
     tokio::spawn(async move {
-        if let Err(e) =
-            run_websocket_server(WEBSOCKET_ADDRESS, frame_buffer_ws, client_counter_ws).await
-        {
+        if let Err(e) = run_websocket_server(&WEBSOCKET_ADDRESS, frame_buffer_ws).await {
             tracing::error!("WebSocket server error: {}", e);
         }
     });
 
-    let client_counter_cam = client_counter.clone();
     tokio::task::spawn_blocking(move || {
-        if let Err(e) = run_camera_capture(frame_buffer, client_counter_cam) {
+        if let Err(e) = run_camera_capture(frame_buffer) {
             tracing::error!("Camera capture error: {}", e);
         }
     })
-        .await?;
+    .await?;
 
     Ok(())
 }
@@ -168,7 +89,6 @@ async fn main() -> color_eyre::Result<()> {
 async fn run_websocket_server(
     addr: &str,
     frame_buffer: SharedFrameBuffer,
-    client_counter: ClientCounter,
 ) -> color_eyre::Result<()> {
     let listener = TcpListener::bind(addr).await?;
     tracing::info!("WebSocket server listening on: {}", addr);
@@ -181,8 +101,7 @@ async fn run_websocket_server(
             stream.local_addr()
         );
         let frame_buffer = frame_buffer.clone();
-        let client_counter = client_counter.clone();
-        tokio::spawn(handle_client(stream, frame_buffer, client_counter, addr));
+        tokio::spawn(handle_client(stream, frame_buffer, addr));
     }
 
     Ok(())
@@ -191,7 +110,6 @@ async fn run_websocket_server(
 async fn handle_client(
     stream: TcpStream,
     frame_buffer: SharedFrameBuffer,
-    client_counter: ClientCounter,
     client_addr: std::net::SocketAddr,
 ) {
     tracing::debug!("Starting WebSocket handshake with client: {}", client_addr);
@@ -209,10 +127,6 @@ async fn handle_client(
             return;
         }
     };
-
-    // Create the guard after successful handshake - this increments the counter
-    // and will automatically decrement when the function returns (guard is dropped)
-    let _client_guard = ClientGuard::new(client_counter);
 
     let (mut write, mut read) = ws_stream.split();
     tracing::debug!(
@@ -244,9 +158,9 @@ async fn handle_client(
                     // Move JPEG encoding to blocking thread pool
                     let encode_start = std::time::Instant::now();
                     let jpeg_data = match tokio::task::spawn_blocking(move || {
-                        encode_as_jpeg_turbo(&rgb_data, width, height, JPEG_QUALITY)
+                        encode_as_jpeg_turbo(&rgb_data, width, height, 85)
                     })
-                        .await
+                    .await
                     {
                         Ok(Ok(data)) => data,
                         Ok(Err(e)) => {
@@ -317,13 +231,9 @@ async fn handle_client(
     }
 
     tracing::debug!("Connection handler for {} terminated", client_addr);
-    // _client_guard is dropped here, decrementing the counter
 }
 
-fn run_camera_capture(
-    frame_buffer: SharedFrameBuffer,
-    client_counter: ClientCounter,
-) -> color_eyre::Result<()> {
+fn run_camera_capture(frame_buffer: SharedFrameBuffer) -> color_eyre::Result<()> {
     let camera_manager = CameraManager::new()?;
     let cameras = camera_manager.cameras();
 
@@ -349,9 +259,7 @@ fn run_camera_capture(
 
     match cfg.validate() {
         CameraConfigurationStatus::Adjusted => {
-            tracing::warn!(
-                "Camera configuration was adjusted after changing frame size: {cfg:#?}"
-            )
+            tracing::warn!("Camera configuration was adjusted after changing frame size: {cfg:#?}")
         }
         CameraConfigurationStatus::Invalid => color_eyre::eyre::bail!(
             "Error validating camera configuration after changing frame_size"
@@ -374,8 +282,7 @@ fn run_camera_capture(
         .map(|buf| MemoryMappedFrameBuffer::new(buf).unwrap())
         .collect::<Vec<_>>();
 
-    // Store requests in a Vec that we can drain and refill
-    let mut pending_reqs: Vec<_> = buffers
+    let reqs = buffers
         .into_iter()
         .enumerate()
         .map(|(i, buf)| {
@@ -383,119 +290,75 @@ fn run_camera_capture(
             req.add_buffer(&stream, buf).unwrap();
             req
         })
-        .collect();
+        .collect::<Vec<_>>();
 
     let (tx, rx) = std::sync::mpsc::channel();
     cam.on_request_completed(move |req| {
         tx.send(req).unwrap();
     });
 
+    cam.start(None)?;
+
+    for req in reqs {
+        tracing::debug!("Request queued for execution: {req:#?}");
+        cam.queue_request(req).map_err(|(_, e)| e)?;
+    }
+
     let mut buffer = DoubleBuffer::new(cfg_ref.get_size());
+    let mut last_capture = std::time::Instant::now();
 
-    // Main loop: alternate between waiting for clients and capturing
     loop {
-        // Wait for at least one client to connect
-        tracing::info!("Waiting for clients to connect...");
-        client_counter.wait_for_clients();
-        tracing::info!("Client connected, starting camera capture");
+        let mut req = rx.recv_timeout(Duration::from_secs(10))?;
+        tracing::debug!("Took {:?} since last capture", last_capture.elapsed());
 
-        // Start camera
-        cam.start(None)?;
-
-        // Queue initial requests
-        for req in pending_reqs.drain(..) {
-            tracing::debug!("Request queued for execution: {req:#?}");
-            cam.queue_request(req).map_err(|(_, e)| e)?;
-        }
-
-        let mut last_capture = std::time::Instant::now();
-
-        // Capture loop - runs while clients are connected
-        loop {
-            // Use timeout to periodically check client count
-            let recv_result = rx.recv_timeout(Duration::from_millis(500));
-
-            // Check if all clients disconnected
-            if !client_counter.has_clients() {
-                tracing::info!("All clients disconnected, stopping camera");
-                break;
-            }
-
-            let mut req = match recv_result {
-                Ok(req) => req,
-                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
-                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
-                    color_eyre::eyre::bail!("Camera request channel disconnected");
-                }
-            };
-
-            tracing::debug!("Took {:?} since last capture", last_capture.elapsed());
-
-            let frame_data = {
-                let instant = std::time::Instant::now();
-
-                tracing::debug!("Camera request {req:?} completed!");
-                tracing::trace!("Metadata: {:#?}", req.metadata());
-
-                let framebuffer: &MemoryMappedFrameBuffer<FrameBuffer> =
-                    req.buffer(&stream).unwrap();
-                tracing::trace!("FrameBuffer metadata: {:#?}", framebuffer.metadata());
-                let frame_metadata_status = framebuffer.metadata().unwrap().status();
-                if frame_metadata_status != FrameMetadataStatus::Success {
-                    tracing::error!("Frame metadata status: {:?}", frame_metadata_status);
-                    req.reuse(ReuseFlag::REUSE_BUFFERS);
-                    cam.queue_request(req).map_err(|(_, e)| e)?;
-                    continue;
-                }
-                let bytes_used = framebuffer
-                    .metadata()
-                    .unwrap()
-                    .planes()
-                    .get(0)
-                    .unwrap()
-                    .bytes_used as usize;
-
-                let planes = framebuffer.data();
-                tracing::trace!("Data Planes: {:?}", planes.len());
-                let frame_data = planes.get(0).unwrap();
-                tracing::debug!("Frame captured in {:?}", instant.elapsed());
-
-                &frame_data[..bytes_used]
-            };
-
+        let frame_data = {
             let instant = std::time::Instant::now();
-            camera_stream.convert_frame(&cfg_ref, frame_data, &mut buffer)?;
-            tracing::debug!("Converted in {:?}", instant.elapsed());
 
-            req.reuse(ReuseFlag::REUSE_BUFFERS);
-            cam.queue_request(req).map_err(|(_, e)| e)?;
+            tracing::debug!("Camera request {req:?} completed!");
+            tracing::trace!("Metadata: {:#?}", req.metadata());
 
-            // Update shared frame buffer
-            frame_buffer.update(buffer.deref());
+            let framebuffer: &MemoryMappedFrameBuffer<FrameBuffer> = req.buffer(&stream).unwrap();
+            tracing::trace!("FrameBuffer metadata: {:#?}", framebuffer.metadata());
+            let frame_metadata_status = framebuffer.metadata().unwrap().status();
+            if frame_metadata_status != FrameMetadataStatus::Success {
+                tracing::error!("Frame metadata status: {:?}", frame_metadata_status);
+                req.reuse(ReuseFlag::REUSE_BUFFERS);
+                cam.queue_request(req).map_err(|(_, e)| e)?;
+                continue;
+            }
+            let bytes_used = framebuffer
+                .metadata()
+                .unwrap()
+                .planes()
+                .get(0)
+                .unwrap()
+                .bytes_used as usize;
 
-            last_capture = std::time::Instant::now();
-            buffer.swap();
-        }
+            let planes = framebuffer.data();
+            tracing::trace!("Data Planes: {:?}", planes.len());
+            let frame_data = planes.get(0).unwrap();
+            tracing::debug!("Frame captured in {:?}", instant.elapsed());
 
-        // Stop camera and clear frame buffer
-        cam.stop()?;
-        frame_buffer.clear();
+            &frame_data[..bytes_used]
+        };
 
-        // Collect all pending requests back
-        while let Ok(req) = rx.try_recv() {
-            pending_reqs.push(req);
-        }
+        let instant = std::time::Instant::now();
+        camera_stream.convert_frame(&cfg_ref, frame_data, &mut buffer)?;
+        tracing::debug!("Converted in {:?}", instant.elapsed());
 
-        // Wait a bit for any in-flight requests to complete
-        std::thread::sleep(Duration::from_millis(100));
-        while let Ok(req) = rx.try_recv() {
-            pending_reqs.push(req);
-        }
+        req.reuse(ReuseFlag::REUSE_BUFFERS);
+        cam.queue_request(req).map_err(|(_, e)| e)?;
+
+        // Update shared frame buffer
+        frame_buffer.update(buffer.deref());
+
+        last_capture = std::time::Instant::now();
+        buffer.swap();
     }
 }
 
 thread_local! {
-    static COMPRESSOR: std::cell::RefCell<Option<Compressor>> = const { std::cell::RefCell::new(None) };
+    static COMPRESSOR: std::cell::RefCell<Option<Compressor>> = std::cell::RefCell::new(None);
 }
 
 fn encode_as_jpeg_turbo(
