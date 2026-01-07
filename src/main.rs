@@ -1,11 +1,10 @@
 use crate::buffer::DoubleBuffer;
-use clap::Parser;
-use color_eyre::eyre::{Context, ContextCompat};
+use color_eyre::eyre::Context;
 use futures_util::{SinkExt, StreamExt};
-use image::{ImageBuffer, ImageEncoder};
 use libcamera::camera::{Camera, CameraConfiguration, CameraConfigurationStatus};
 use libcamera::camera_manager::CameraManager;
-use libcamera::framebuffer::{AsFrameBuffer, FrameMetadataStatus};
+use libcamera::framebuffer::AsFrameBuffer;
+use libcamera::framebuffer::{FrameMetadataStatus};
 use libcamera::framebuffer_allocator::{FrameBuffer, FrameBufferAllocator};
 use libcamera::framebuffer_map::MemoryMappedFrameBuffer;
 use libcamera::geometry::Size;
@@ -13,8 +12,7 @@ use libcamera::pixel_format::PixelFormat;
 use libcamera::request::ReuseFlag;
 use libcamera::stream::{StreamConfigurationRef, StreamRole};
 use libcamera::*;
-use std::ops::{Deref, DerefMut};
-use std::str::FromStr;
+use std::ops::Deref;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::net::{TcpListener, TcpStream};
@@ -28,14 +26,23 @@ use crate::yuyv::YuyvStream;
 mod buffer;
 mod yuyv;
 
-const WIDTH: u32 = 1920;
-const HEIGHT: u32 = 1080;
+// Capture at native resolution for better quality source
+const CAPTURE_WIDTH: u32 = 1920;
+const CAPTURE_HEIGHT: u32 = 1080;
+
+// Output resolution (720p) - optimized for Pi 3B network bandwidth
+const OUTPUT_WIDTH: u32 = 1280;
+const OUTPUT_HEIGHT: u32 = 720;
+
 const WEBSOCKET_ADDRESS: &str = "0.0.0.0:8080";
-const JPEG_QUALITY: i32 = 85;
+
+// Reduced quality for Pi 3B - balances quality vs encoding speed
+const JPEG_QUALITY: i32 = 75;
 
 // Shared state for the latest frame
 #[derive(Clone)]
 struct SharedFrameBuffer {
+    // Stores the scaled RGB data ready for JPEG encoding
     data: Arc<Mutex<Option<Vec<u8>>>>,
     width: u32,
     height: u32,
@@ -50,15 +57,165 @@ impl SharedFrameBuffer {
         }
     }
 
-    fn update(&self, frame_data: &[u8]) {
+    fn update(&self, frame_data: Vec<u8>) {
         let mut data = self.data.lock().unwrap();
-        *data = Some(frame_data.to_vec());
+        *data = Some(frame_data);
     }
 
     fn get_rgb(&self) -> Option<Vec<u8>> {
         let data = self.data.lock().unwrap();
         data.clone()
     }
+}
+
+/// Scales RGB image using bilinear interpolation
+/// Optimized for Raspberry Pi 3B with integer arithmetic where possible
+fn scale_rgb_bilinear(
+    src: &[u8],
+    src_width: u32,
+    src_height: u32,
+    dst_width: u32,
+    dst_height: u32,
+) -> Vec<u8> {
+    let mut dst = vec![0u8; (dst_width * dst_height * 3) as usize];
+
+    // Pre-calculate scaling factors using fixed-point arithmetic (16.16)
+    let x_ratio = ((src_width - 1) << 16) / dst_width;
+    let y_ratio = ((src_height - 1) << 16) / dst_height;
+
+    let src_stride = (src_width * 3) as usize;
+    let dst_stride = (dst_width * 3) as usize;
+
+    for dst_y in 0..dst_height {
+        let y_fixed = (dst_y * y_ratio) as usize;
+        let y_int = y_fixed >> 16;
+        let y_frac = (y_fixed & 0xFFFF) as u32;
+        let y_inv = 0x10000 - y_frac;
+
+        let src_row0 = y_int * src_stride;
+        let src_row1 = (y_int + 1).min((src_height - 1) as usize) * src_stride;
+        let dst_row = (dst_y as usize) * dst_stride;
+
+        for dst_x in 0..dst_width {
+            let x_fixed = (dst_x * x_ratio) as usize;
+            let x_int = x_fixed >> 16;
+            let x_frac = (x_fixed & 0xFFFF) as u32;
+            let x_inv = 0x10000 - x_frac;
+
+            let x0 = x_int * 3;
+            let x1 = ((x_int + 1).min((src_width - 1) as usize)) * 3;
+
+            // Bilinear interpolation for each channel
+            for c in 0..3 {
+                let p00 = src[src_row0 + x0 + c] as u32;
+                let p10 = src[src_row0 + x1 + c] as u32;
+                let p01 = src[src_row1 + x0 + c] as u32;
+                let p11 = src[src_row1 + x1 + c] as u32;
+
+                // Fixed-point bilinear interpolation
+                let top = (p00 * x_inv + p10 * x_frac) >> 16;
+                let bottom = (p01 * x_inv + p11 * x_frac) >> 16;
+                let value = (top * y_inv + bottom * y_frac) >> 16;
+
+                dst[dst_row + (dst_x as usize) * 3 + c] = value as u8;
+            }
+        }
+    }
+
+    dst
+}
+
+/// Faster nearest-neighbor scaling - use this if bilinear is too slow on Pi 3B
+#[allow(dead_code)]
+fn scale_rgb_nearest(
+    src: &[u8],
+    src_width: u32,
+    src_height: u32,
+    dst_width: u32,
+    dst_height: u32,
+) -> Vec<u8> {
+    let mut dst = vec![0u8; (dst_width * dst_height * 3) as usize];
+
+    let x_ratio = (src_width << 16) / dst_width;
+    let y_ratio = (src_height << 16) / dst_height;
+
+    let src_stride = (src_width * 3) as usize;
+    let dst_stride = (dst_width * 3) as usize;
+
+    for dst_y in 0..dst_height {
+        let src_y = ((dst_y * y_ratio) >> 16) as usize;
+        let src_row = src_y * src_stride;
+        let dst_row = (dst_y as usize) * dst_stride;
+
+        for dst_x in 0..dst_width {
+            let src_x = ((dst_x * x_ratio) >> 16) as usize;
+            let src_offset = src_row + src_x * 3;
+            let dst_offset = dst_row + (dst_x as usize) * 3;
+
+            dst[dst_offset] = src[src_offset];
+            dst[dst_offset + 1] = src[src_offset + 1];
+            dst[dst_offset + 2] = src[src_offset + 2];
+        }
+    }
+
+    dst
+}
+
+/// Box filter scaling - good balance between speed and quality for downscaling
+/// Particularly effective for 2:1 or similar scale factors
+fn scale_rgb_box(
+    src: &[u8],
+    src_width: u32,
+    src_height: u32,
+    dst_width: u32,
+    dst_height: u32,
+) -> Vec<u8> {
+    let mut dst = vec![0u8; (dst_width * dst_height * 3) as usize];
+
+    let x_scale = src_width as f32 / dst_width as f32;
+    let y_scale = src_height as f32 / dst_height as f32;
+
+    let src_stride = (src_width * 3) as usize;
+    let dst_stride = (dst_width * 3) as usize;
+
+    for dst_y in 0..dst_height {
+        let src_y_start = (dst_y as f32 * y_scale) as u32;
+        let src_y_end = ((dst_y + 1) as f32 * y_scale).ceil() as u32;
+        let src_y_end = src_y_end.min(src_height);
+
+        let dst_row = (dst_y as usize) * dst_stride;
+
+        for dst_x in 0..dst_width {
+            let src_x_start = (dst_x as f32 * x_scale) as u32;
+            let src_x_end = ((dst_x + 1) as f32 * x_scale).ceil() as u32;
+            let src_x_end = src_x_end.min(src_width);
+
+            let mut sum_r: u32 = 0;
+            let mut sum_g: u32 = 0;
+            let mut sum_b: u32 = 0;
+            let mut count: u32 = 0;
+
+            for src_y in src_y_start..src_y_end {
+                let src_row = (src_y as usize) * src_stride;
+                for src_x in src_x_start..src_x_end {
+                    let src_offset = src_row + (src_x as usize) * 3;
+                    sum_r += src[src_offset] as u32;
+                    sum_g += src[src_offset + 1] as u32;
+                    sum_b += src[src_offset + 2] as u32;
+                    count += 1;
+                }
+            }
+
+            let dst_offset = dst_row + (dst_x as usize) * 3;
+            if count > 0 {
+                dst[dst_offset] = (sum_r / count) as u8;
+                dst[dst_offset + 1] = (sum_g / count) as u8;
+                dst[dst_offset + 2] = (sum_b / count) as u8;
+            }
+        }
+    }
+
+    dst
 }
 
 #[tokio::main]
@@ -68,12 +225,13 @@ async fn main() -> color_eyre::Result<()> {
         .with(EnvFilter::from_default_env())
         .init();
 
-    let frame_buffer = SharedFrameBuffer::new(WIDTH, HEIGHT);
+    // Output buffer uses scaled dimensions
+    let frame_buffer = SharedFrameBuffer::new(OUTPUT_WIDTH, OUTPUT_HEIGHT);
 
     // Start WebSocket server
     let frame_buffer_ws = frame_buffer.clone();
     tokio::spawn(async move {
-        if let Err(e) = run_websocket_server(&WEBSOCKET_ADDRESS, frame_buffer_ws).await {
+        if let Err(e) = run_websocket_server(WEBSOCKET_ADDRESS, frame_buffer_ws).await {
             tracing::error!("WebSocket server error: {}", e);
         }
     });
@@ -83,7 +241,7 @@ async fn main() -> color_eyre::Result<()> {
             tracing::error!("Camera capture error: {}", e);
         }
     })
-    .await?;
+        .await?;
 
     Ok(())
 }
@@ -97,11 +255,6 @@ async fn run_websocket_server(
 
     while let Ok((stream, addr)) = listener.accept().await {
         tracing::info!("New WebSocket connection from: {}", addr);
-        tracing::debug!(
-            "Client address details: {:?}, local address: {:?}",
-            addr,
-            stream.local_addr()
-        );
         let frame_buffer = frame_buffer.clone();
         tokio::spawn(handle_client(stream, frame_buffer, addr));
     }
@@ -131,20 +284,12 @@ async fn handle_client(
     };
 
     let (mut write, mut read) = ws_stream.split();
-    tracing::debug!(
-        "WebSocket connection established with {}, waiting for messages",
-        client_addr
-    );
 
     while let Some(msg) = read.next().await {
         match msg {
             Ok(Message::Text(text)) => {
-                tracing::debug!("Received text message from {}: {:?}", client_addr, text);
                 if text.trim() == "s" {
-                    tracing::debug!(
-                        "Received 's' command from {}, sending latest frame",
-                        client_addr
-                    );
+                    tracing::debug!("Received 's' command from {}", client_addr);
 
                     let rgb_data = match frame_buffer.get_rgb() {
                         Some(data) => data,
@@ -157,20 +302,15 @@ async fn handle_client(
                     let width = frame_buffer.width;
                     let height = frame_buffer.height;
 
-                    // Move JPEG encoding to blocking thread pool
                     let encode_start = std::time::Instant::now();
                     let jpeg_data = match tokio::task::spawn_blocking(move || {
-                        encode_as_jpeg_turbo(&rgb_data, width, height, 85)
+                        encode_as_jpeg_turbo(&rgb_data, width, height, JPEG_QUALITY)
                     })
-                    .await
+                        .await
                     {
                         Ok(Ok(data)) => data,
                         Ok(Err(e)) => {
-                            tracing::error!(
-                                "JPEG encoding error for client {}: {}",
-                                client_addr,
-                                e
-                            );
+                            tracing::error!("JPEG encoding error for client {}: {}", client_addr, e);
                             continue;
                         }
                         Err(e) => {
@@ -180,51 +320,24 @@ async fn handle_client(
                     };
 
                     let encode_duration = encode_start.elapsed();
-                    let data_len = jpeg_data.len();
                     tracing::debug!(
                         "JPEG encoding completed for {}: {} bytes in {:?}",
                         client_addr,
-                        data_len,
+                        jpeg_data.len(),
                         encode_duration
                     );
 
-                    let send_start = std::time::Instant::now();
                     if let Err(e) = write.send(Message::Binary(jpeg_data.into())).await {
                         tracing::error!("Error sending frame to {}: {}", client_addr, e);
                         break;
                     }
-                    let send_duration = send_start.elapsed();
-                    tracing::debug!(
-                        "Frame sent to {} successfully: {} bytes in {:?} ({:.2} MB/s)",
-                        client_addr,
-                        data_len,
-                        send_duration,
-                        data_len as f64 / send_duration.as_secs_f64() / 1_000_000.0
-                    );
-                } else {
-                    tracing::debug!("Received unknown command from {}: {:?}", client_addr, text);
                 }
             }
             Ok(Message::Close(frame)) => {
                 tracing::info!("Client {} disconnected: {:?}", client_addr, frame);
                 break;
             }
-            Ok(Message::Ping(data)) => {
-                tracing::debug!("Received ping from {}: {} bytes", client_addr, data.len());
-            }
-            Ok(Message::Pong(data)) => {
-                tracing::debug!("Received pong from {}: {} bytes", client_addr, data.len());
-            }
-            Ok(Message::Binary(data)) => {
-                tracing::debug!(
-                    "Received binary message from {}: {} bytes",
-                    client_addr,
-                    data.len()
-                );
-            }
-            Ok(Message::Frame(_)) => {
-                tracing::debug!("Received raw frame from {}", client_addr);
-            }
+            Ok(Message::Ping(_)) | Ok(Message::Pong(_)) | Ok(Message::Binary(_)) | Ok(Message::Frame(_)) => {}
             Err(e) => {
                 tracing::error!("WebSocket error with {}: {}", client_addr, e);
                 break;
@@ -255,20 +368,20 @@ fn run_camera_capture(frame_buffer: SharedFrameBuffer) -> color_eyre::Result<()>
         color_eyre::eyre::bail!("No supported stream format found");
     };
 
-    cfg.get_mut(0).unwrap().set_size(Size::new(WIDTH, HEIGHT));
+    // Capture at full resolution for better quality source
+    cfg.get_mut(0).unwrap().set_size(Size::new(CAPTURE_WIDTH, CAPTURE_HEIGHT));
 
     match cfg.validate() {
         CameraConfigurationStatus::Adjusted => {
-            tracing::warn!("Camera configuration was adjusted after changing frame size: {cfg:#?}")
+            tracing::warn!("Camera configuration was adjusted: {cfg:#?}")
         }
-        CameraConfigurationStatus::Invalid => color_eyre::eyre::bail!(
-            "Error validating camera configuration after changing frame_size"
-        ),
+        CameraConfigurationStatus::Invalid => {
+            color_eyre::eyre::bail!("Error validating camera configuration")
+        }
         _ => {}
     }
 
-    cam.configure(&mut cfg)
-        .context("Unable to configure camera")?;
+    cam.configure(&mut cfg).context("Unable to configure camera")?;
 
     let mut alloc = FrameBufferAllocator::new(&cam);
 
@@ -304,8 +417,12 @@ fn run_camera_capture(frame_buffer: SharedFrameBuffer) -> color_eyre::Result<()>
         cam.queue_request(req).map_err(|(_, e)| e)?;
     }
 
+    // Buffer for full-resolution RGB conversion
     let mut buffer = DoubleBuffer::new(cfg_ref.get_size());
     let mut last_capture = std::time::Instant::now();
+
+    // Pre-allocate scaling buffer to avoid repeated allocations
+    let scaled_buffer_size = (OUTPUT_WIDTH * OUTPUT_HEIGHT * 3) as usize;
 
     loop {
         let mut req = rx.recv_timeout(Duration::from_secs(10))?;
@@ -314,18 +431,16 @@ fn run_camera_capture(frame_buffer: SharedFrameBuffer) -> color_eyre::Result<()>
         let frame_data = {
             let instant = std::time::Instant::now();
 
-            tracing::debug!("Camera request {req:?} completed!");
-            tracing::trace!("Metadata: {:#?}", req.metadata());
-
             let framebuffer: &MemoryMappedFrameBuffer<FrameBuffer> = req.buffer(&stream).unwrap();
-            tracing::trace!("FrameBuffer metadata: {:#?}", framebuffer.metadata());
             let frame_metadata_status = framebuffer.metadata().unwrap().status();
+
             if frame_metadata_status != FrameMetadataStatus::Success {
                 tracing::error!("Frame metadata status: {:?}", frame_metadata_status);
                 req.reuse(ReuseFlag::REUSE_BUFFERS);
                 cam.queue_request(req).map_err(|(_, e)| e)?;
                 continue;
             }
+
             let bytes_used = framebuffer
                 .metadata()
                 .unwrap()
@@ -335,22 +450,33 @@ fn run_camera_capture(frame_buffer: SharedFrameBuffer) -> color_eyre::Result<()>
                 .bytes_used as usize;
 
             let planes = framebuffer.data();
-            tracing::trace!("Data Planes: {:?}", planes.len());
             let frame_data = planes.get(0).unwrap();
             tracing::debug!("Frame captured in {:?}", instant.elapsed());
 
             &frame_data[..bytes_used]
         };
 
-        let instant = std::time::Instant::now();
+        // Convert YUYV to RGB at full resolution
+        let convert_instant = std::time::Instant::now();
         camera_stream.convert_frame(&cfg_ref, frame_data, &mut buffer)?;
-        tracing::debug!("Converted in {:?}", instant.elapsed());
+        tracing::debug!("YUYV->RGB conversion in {:?}", convert_instant.elapsed());
+
+        // Scale down to 720p
+        let scale_instant = std::time::Instant::now();
+        let scaled_rgb = scale_rgb_bilinear(
+            buffer.deref(),
+            CAPTURE_WIDTH,
+            CAPTURE_HEIGHT,
+            OUTPUT_WIDTH,
+            OUTPUT_HEIGHT,
+        );
+        tracing::debug!("Scaling to 720p in {:?}", scale_instant.elapsed());
 
         req.reuse(ReuseFlag::REUSE_BUFFERS);
         cam.queue_request(req).map_err(|(_, e)| e)?;
 
-        // Update shared frame buffer
-        frame_buffer.update(buffer.deref());
+        // Update shared frame buffer with scaled data
+        frame_buffer.update(scaled_rgb);
 
         last_capture = std::time::Instant::now();
         buffer.swap();
@@ -358,7 +484,7 @@ fn run_camera_capture(frame_buffer: SharedFrameBuffer) -> color_eyre::Result<()>
 }
 
 thread_local! {
-    static COMPRESSOR: std::cell::RefCell<Option<Compressor>> = std::cell::RefCell::new(None);
+    static COMPRESSOR: std::cell::RefCell<Option<Compressor>> = const { std::cell::RefCell::new(None) };
 }
 
 fn encode_as_jpeg_turbo(
@@ -373,6 +499,7 @@ fn encode_as_jpeg_turbo(
         if comp_opt.is_none() {
             let mut compressor = Compressor::new().map_err(|e| e.to_string())?;
             compressor.set_quality(quality).map_err(|e| e.to_string())?;
+            // Use 4:2:0 subsampling for better compression
             compressor
                 .set_subsamp(Subsamp::Sub2x2)
                 .map_err(|e| e.to_string())?;
