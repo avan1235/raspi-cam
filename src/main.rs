@@ -1,6 +1,6 @@
 use crate::buffer::DoubleBuffer;
 use clap::Parser;
-use color_eyre::eyre::Context;
+use color_eyre::eyre::{Context, ContextCompat};
 use futures_util::{SinkExt, StreamExt};
 use image::{ImageBuffer, ImageEncoder};
 use libcamera::camera::{Camera, CameraConfiguration, CameraConfigurationStatus};
@@ -14,6 +14,7 @@ use libcamera::request::ReuseFlag;
 use libcamera::stream::{StreamConfigurationRef, StreamRole};
 use libcamera::*;
 use std::ops::{Deref, DerefMut};
+use std::str::FromStr;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::net::{TcpListener, TcpStream};
@@ -22,6 +23,7 @@ use tracing_subscriber::EnvFilter;
 use tracing_subscriber::fmt;
 use tracing_subscriber::prelude::*;
 use turbojpeg::{Compressor, Image, PixelFormat as TJPixelFormat, Subsamp};
+use crate::yuyv::YuyvStream;
 
 mod buffer;
 mod yuyv;
@@ -246,12 +248,10 @@ fn run_camera_capture(frame_buffer: SharedFrameBuffer) -> color_eyre::Result<()>
 
     let mut cam = cam.acquire()?;
 
-    let stream_formats = vec![yuyv::YuyvStream];
-    let camera_stream = stream_formats
-        .into_iter()
-        .find_map(|stream| stream.is_supported(&cam).map(|cfg| (stream, cfg)));
-
-    let Some((camera_stream, mut cfg)) = camera_stream else {
+    let camera_stream = YuyvStream;
+    let (camera_stream, mut cfg) = if let Some(cfg) = camera_stream.is_supported(&cam) {
+        (camera_stream, cfg)
+    } else {
         color_eyre::eyre::bail!("No supported stream format found");
     };
 
