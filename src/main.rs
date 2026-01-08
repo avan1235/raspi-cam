@@ -1,4 +1,3 @@
-use crate::buffer::DoubleBuffer;
 use color_eyre::eyre::Context;
 use futures_util::{SinkExt, StreamExt};
 use libcamera::camera::{Camera, CameraConfiguration, CameraConfigurationStatus};
@@ -19,21 +18,18 @@ use std::time::Duration;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{broadcast, watch};
 use tokio_tungstenite::{accept_async, tungstenite::Message};
+use tracing_subscriber::EnvFilter;
 use tracing_subscriber::fmt;
 use tracing_subscriber::prelude::*;
-use tracing_subscriber::EnvFilter;
 use turbojpeg::{Compressor, Image, PixelFormat as TJPixelFormat, Subsamp};
 
 use crate::yuyv::YuyvStream;
 
-mod buffer;
 mod yuyv;
 
-// Capture at native resolution for better quality source
 const CAPTURE_WIDTH: u32 = 1920;
 const CAPTURE_HEIGHT: u32 = 1080;
 
-// Output resolution (720p) - optimized for Pi 3B network bandwidth
 const OUTPUT_WIDTH: u32 = 640;
 const OUTPUT_HEIGHT: u32 = 360;
 
@@ -116,18 +112,15 @@ impl FrameCoordinator {
             let state = self.state.lock().unwrap();
             state.rgb_data.clone()
         })
-            .await;
+        .await;
 
         // Decrement waiting count
         self.waiting_clients.fetch_sub(1, Ordering::SeqCst);
 
-        match result {
-            Ok(data) => data,
-            Err(_) => {
-                tracing::warn!("Timeout waiting for frame");
-                None
-            }
-        }
+        result.unwrap_or_else(|_| {
+            tracing::warn!("Timeout waiting for frame");
+            None
+        })
     }
 
     /// Called by camera thread to check if any clients need frames
@@ -148,32 +141,25 @@ impl FrameCoordinator {
         }
     }
 
-    /// Called by camera thread to publish a new frame
-    fn publish_frame(&self, rgb_data: Vec<u8>) {
+    fn publish_frame(&self, rgb_data: &[u8]) {
         let new_seq = {
             let mut state = self.state.lock().unwrap();
             state.frame_seq += 1;
-            state.rgb_data = Some(rgb_data);
+            state.rgb_data = Some(rgb_data.to_vec());
             state.frame_seq
         };
-
-        // Notify all waiting clients
         let _ = self.frame_notify.send(new_seq);
     }
 }
 
-/// Scales RGB image using bilinear interpolation
-/// Optimized for Raspberry Pi 3B with integer arithmetic where possible
 fn scale_rgb_bilinear(
     src: &[u8],
+    dst: &mut [u8],
     src_width: u32,
     src_height: u32,
     dst_width: u32,
     dst_height: u32,
-) -> Vec<u8> {
-    let mut dst = vec![0u8; (dst_width * dst_height * 3) as usize];
-
-    // Pre-calculate scaling factors using fixed-point arithmetic (16.16)
+) {
     let x_ratio = ((src_width - 1) << 16) / dst_width;
     let y_ratio = ((src_height - 1) << 16) / dst_height;
 
@@ -215,8 +201,6 @@ fn scale_rgb_bilinear(
             }
         }
     }
-
-    dst
 }
 
 #[tokio::main]
@@ -242,15 +226,12 @@ async fn main() -> color_eyre::Result<()> {
             tracing::error!("Camera capture error: {}", e);
         }
     })
-        .await?;
+    .await?;
 
     Ok(())
 }
 
-async fn run_websocket_server(
-    addr: &str,
-    coordinator: FrameCoordinator,
-) -> color_eyre::Result<()> {
+async fn run_websocket_server(addr: &str, coordinator: FrameCoordinator) -> color_eyre::Result<()> {
     let listener = TcpListener::bind(addr).await?;
     tracing::info!("WebSocket server listening on: {}", addr);
 
@@ -314,11 +295,15 @@ async fn handle_client(
                     let jpeg_data = match tokio::task::spawn_blocking(move || {
                         encode_as_jpeg_turbo(&rgb_data, width, height, JPEG_QUALITY)
                     })
-                        .await
+                    .await
                     {
                         Ok(Ok(data)) => data,
                         Ok(Err(e)) => {
-                            tracing::error!("JPEG encoding error for client {}: {}", client_addr, e);
+                            tracing::error!(
+                                "JPEG encoding error for client {}: {}",
+                                client_addr,
+                                e
+                            );
                             continue;
                         }
                         Err(e) => {
@@ -379,7 +364,6 @@ fn run_camera_capture(coordinator: FrameCoordinator) -> color_eyre::Result<()> {
         color_eyre::eyre::bail!("No supported stream format found");
     };
 
-    // Capture at full resolution for better quality source
     cfg.get_mut(0)
         .unwrap()
         .set_size(Size::new(CAPTURE_WIDTH, CAPTURE_HEIGHT));
@@ -426,13 +410,12 @@ fn run_camera_capture(coordinator: FrameCoordinator) -> color_eyre::Result<()> {
 
     cam.start(None)?;
 
-    // Buffer for full-resolution RGB conversion
-    let mut buffer = DoubleBuffer::new(cfg_ref.get_size());
+    let mut buffer = vec![0; (CAPTURE_WIDTH * CAPTURE_HEIGHT * 4) as usize];
+    let mut scaled = vec![0u8; (OUTPUT_WIDTH * OUTPUT_HEIGHT * 3) as usize];
     let mut last_capture = std::time::Instant::now();
 
     // Track whether we have requests queued
     let mut requests_queued = 0;
-    let total_requests = reqs.len();
 
     // Store requests for later queuing
     let mut pending_requests: Vec<_> = reqs.into_iter().collect();
@@ -518,10 +501,10 @@ fn run_camera_capture(coordinator: FrameCoordinator) -> color_eyre::Result<()> {
         camera_stream.convert_frame(&cfg_ref, frame_data, &mut buffer)?;
         tracing::debug!("YUYV->RGB conversion in {:?}", convert_instant.elapsed());
 
-        // Scale down to output resolution
         let scale_instant = std::time::Instant::now();
-        let scaled_rgb = scale_rgb_bilinear(
-            buffer.deref(),
+        scale_rgb_bilinear(
+            &buffer,
+            &mut scaled,
             CAPTURE_WIDTH,
             CAPTURE_HEIGHT,
             OUTPUT_WIDTH,
@@ -532,11 +515,10 @@ fn run_camera_capture(coordinator: FrameCoordinator) -> color_eyre::Result<()> {
         req.reuse(ReuseFlag::REUSE_BUFFERS);
 
         // Publish the frame to waiting clients
-        coordinator.publish_frame(scaled_rgb);
+        coordinator.publish_frame(&scaled);
         tracing::debug!("Frame published to clients");
 
         last_capture = std::time::Instant::now();
-        buffer.swap();
 
         // Re-queue the request only if there's still demand
         if coordinator.has_waiting_clients() {
