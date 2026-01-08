@@ -1,112 +1,106 @@
+use crate::buffer::DoubleBuffer;
 use color_eyre::eyre::Context;
 use futures_util::{SinkExt, StreamExt};
-use std::io::{BufRead, BufReader, Read};
-use std::process::{Child, Command, Stdio};
+use libcamera::camera::{Camera, CameraConfiguration, CameraConfigurationStatus};
+use libcamera::camera_manager::CameraManager;
+use libcamera::framebuffer::AsFrameBuffer;
+use libcamera::framebuffer::FrameMetadataStatus;
+use libcamera::framebuffer_allocator::{FrameBuffer, FrameBufferAllocator};
+use libcamera::framebuffer_map::MemoryMappedFrameBuffer;
+use libcamera::geometry::Size;
+use libcamera::pixel_format::PixelFormat;
+use libcamera::request::ReuseFlag;
+use libcamera::stream::{StreamConfigurationRef, StreamRole};
+use libcamera::*;
+use std::ops::Deref;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 use std::time::Duration;
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::watch;
+use tokio::sync::{broadcast, watch};
 use tokio_tungstenite::{accept_async, tungstenite::Message};
 use tracing_subscriber::fmt;
 use tracing_subscriber::prelude::*;
 use tracing_subscriber::EnvFilter;
+use turbojpeg::{Compressor, Image, PixelFormat as TJPixelFormat, Subsamp};
 
-const CAPTURE_WIDTH: u32 = 640;
-const CAPTURE_HEIGHT: u32 = 480;
+use crate::yuyv::YuyvStream;
+
+mod buffer;
+mod yuyv;
+
+// Capture at native resolution for better quality source
+const CAPTURE_WIDTH: u32 = 1920;
+const CAPTURE_HEIGHT: u32 = 1080;
+
+// Output resolution (720p) - optimized for Pi 3B network bandwidth
+const OUTPUT_WIDTH: u32 = 640;
+const OUTPUT_HEIGHT: u32 = 360;
 
 const WEBSOCKET_ADDRESS: &str = "0.0.0.0:8080";
 
-/// MJPEG frame markers
-const JPEG_SOI: [u8; 2] = [0xFF, 0xD8]; // Start of Image
-const JPEG_EOI: [u8; 2] = [0xFF, 0xD9]; // End of Image
+// Reduced quality for Pi 3B - balances quality vs encoding speed
+const JPEG_QUALITY: i32 = 75;
 
-/// Shared state for frame data
+/// Shared state for frame data and demand signaling
 struct FrameState {
-    /// The latest JPEG frame data
-    jpeg_data: Option<Vec<u8>>,
+    /// The latest RGB frame data (scaled)
+    rgb_data: Option<Vec<u8>>,
     /// Frame sequence number - incremented each time a new frame is captured
     frame_seq: u64,
 }
 
-/// Coordinator for frame distribution
+/// Coordinator for on-demand frame capture
 #[derive(Clone)]
 struct FrameCoordinator {
     /// Current frame state
     state: Arc<Mutex<FrameState>>,
-    /// Number of clients currently connected
-    connected_clients: Arc<AtomicUsize>,
+    /// Condition variable to wake up camera thread when frames are needed
+    frame_needed: Arc<Condvar>,
+    /// Number of clients currently waiting for a frame
+    waiting_clients: Arc<AtomicUsize>,
     /// Watch channel to notify clients when new frame is available
     frame_notify: watch::Sender<u64>,
     /// Receiver for frame notifications
     frame_receiver: watch::Receiver<u64>,
+    /// Frame dimensions
+    width: u32,
+    height: u32,
 }
 
 impl FrameCoordinator {
-    fn new() -> Self {
+    fn new(width: u32, height: u32) -> Self {
         let (frame_notify, frame_receiver) = watch::channel(0u64);
         Self {
             state: Arc::new(Mutex::new(FrameState {
-                jpeg_data: None,
+                rgb_data: None,
                 frame_seq: 0,
             })),
-            connected_clients: Arc::new(AtomicUsize::new(0)),
+            frame_needed: Arc::new(Condvar::new()),
+            waiting_clients: Arc::new(AtomicUsize::new(0)),
             frame_notify,
             frame_receiver,
+            width,
+            height,
         }
     }
 
-    /// Called by clients to get the latest frame
-    async fn get_latest_frame(&self) -> Option<Vec<u8>> {
-        // Get current frame sequence
+    /// Called by clients to request a frame. Blocks until a fresh frame is available.
+    async fn request_frame(&self) -> Option<Vec<u8>> {
+        // Get current frame sequence before signaling
         let current_seq = {
             let state = self.state.lock().unwrap();
             state.frame_seq
         };
 
-        // If we have a frame already, return it immediately
-        if current_seq > 0 {
-            let state = self.state.lock().unwrap();
-            return state.jpeg_data.clone();
-        }
+        // Increment waiting count and signal camera thread
+        self.waiting_clients.fetch_add(1, Ordering::SeqCst);
+        self.frame_needed.notify_one();
 
-        // Otherwise wait for the first frame
+        // Wait for a new frame (sequence number greater than what we saw)
         let mut receiver = self.frame_receiver.clone();
 
-        let result = tokio::time::timeout(Duration::from_secs(5), async {
-            loop {
-                if receiver.changed().await.is_err() {
-                    return None;
-                }
-                let new_seq = *receiver.borrow();
-                if new_seq > 0 {
-                    break;
-                }
-            }
-
-            let state = self.state.lock().unwrap();
-            state.jpeg_data.clone()
-        })
-            .await;
-
-        match result {
-            Ok(data) => data,
-            Err(_) => {
-                tracing::warn!("Timeout waiting for first frame");
-                None
-            }
-        }
-    }
-
-    /// Wait for a new frame (used when client wants to wait for fresh data)
-    async fn wait_for_new_frame(&self) -> Option<Vec<u8>> {
-        let current_seq = {
-            let state = self.state.lock().unwrap();
-            state.frame_seq
-        };
-
-        let mut receiver = self.frame_receiver.clone();
-
+        // Use tokio::select with timeout to avoid indefinite waiting
         let result = tokio::time::timeout(Duration::from_secs(5), async {
             loop {
                 if receiver.changed().await.is_err() {
@@ -118,38 +112,48 @@ impl FrameCoordinator {
                 }
             }
 
+            // Get the frame data
             let state = self.state.lock().unwrap();
-            state.jpeg_data.clone()
+            state.rgb_data.clone()
         })
             .await;
+
+        // Decrement waiting count
+        self.waiting_clients.fetch_sub(1, Ordering::SeqCst);
 
         match result {
             Ok(data) => data,
             Err(_) => {
-                tracing::warn!("Timeout waiting for new frame");
+                tracing::warn!("Timeout waiting for frame");
                 None
             }
         }
     }
 
-    fn increment_clients(&self) {
-        self.connected_clients.fetch_add(1, Ordering::SeqCst);
+    /// Called by camera thread to check if any clients need frames
+    fn has_waiting_clients(&self) -> bool {
+        self.waiting_clients.load(Ordering::SeqCst) > 0
     }
 
-    fn decrement_clients(&self) {
-        self.connected_clients.fetch_sub(1, Ordering::SeqCst);
+    /// Called by camera thread to wait until clients need frames
+    fn wait_for_demand(&self, timeout: Duration) -> bool {
+        let state = self.state.lock().unwrap();
+        let result = self
+            .frame_needed
+            .wait_timeout_while(state, timeout, |_| !self.has_waiting_clients());
+
+        match result {
+            Ok((_, timeout_result)) => !timeout_result.timed_out(),
+            Err(_) => false,
+        }
     }
 
-    fn has_clients(&self) -> bool {
-        self.connected_clients.load(Ordering::SeqCst) > 0
-    }
-
-    /// Called by capture thread to publish a new frame
-    fn publish_frame(&self, jpeg_data: Vec<u8>) {
+    /// Called by camera thread to publish a new frame
+    fn publish_frame(&self, rgb_data: Vec<u8>) {
         let new_seq = {
             let mut state = self.state.lock().unwrap();
             state.frame_seq += 1;
-            state.jpeg_data = Some(jpeg_data);
+            state.rgb_data = Some(rgb_data);
             state.frame_seq
         };
 
@@ -158,125 +162,61 @@ impl FrameCoordinator {
     }
 }
 
-/// Manages the v4l2-ctl process
-struct V4l2Process {
-    child: Child,
-}
+/// Scales RGB image using bilinear interpolation
+/// Optimized for Raspberry Pi 3B with integer arithmetic where possible
+fn scale_rgb_bilinear(
+    src: &[u8],
+    src_width: u32,
+    src_height: u32,
+    dst_width: u32,
+    dst_height: u32,
+) -> Vec<u8> {
+    let mut dst = vec![0u8; (dst_width * dst_height * 3) as usize];
 
-impl V4l2Process {
-    fn spawn(device: &str, width: u32, height: u32) -> color_eyre::Result<Self> {
-        let child = Command::new("v4l2-ctl")
-            .args([
-                "-d",
-                device,
-                "--set-fmt-video-out",
-                &format!("width={},height={},pixelformat=YUYV", width, height),
-                "--set-fmt-video",
-                &format!("width={},height={},pixelformat=MJPG", width, height),
-                "--stream-mmap",
-                "--stream-to=-", // Output to stdout
-            ])
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .context("Failed to spawn v4l2-ctl process")?;
+    // Pre-calculate scaling factors using fixed-point arithmetic (16.16)
+    let x_ratio = ((src_width - 1) << 16) / dst_width;
+    let y_ratio = ((src_height - 1) << 16) / dst_height;
 
-        tracing::info!("Started v4l2-ctl process with PID {}", child.id());
+    let src_stride = (src_width * 3) as usize;
+    let dst_stride = (dst_width * 3) as usize;
 
-        Ok(Self { child })
-    }
+    for dst_y in 0..dst_height {
+        let y_fixed = (dst_y * y_ratio) as usize;
+        let y_int = y_fixed >> 16;
+        let y_frac = (y_fixed & 0xFFFF) as u32;
+        let y_inv = 0x10000 - y_frac;
 
-    fn take_stdout(&mut self) -> Option<std::process::ChildStdout> {
-        self.child.stdout.take()
-    }
-}
+        let src_row0 = y_int * src_stride;
+        let src_row1 = (y_int + 1).min((src_height - 1) as usize) * src_stride;
+        let dst_row = (dst_y as usize) * dst_stride;
 
-impl Drop for V4l2Process {
-    fn drop(&mut self) {
-        tracing::info!("Terminating v4l2-ctl process");
-        let _ = self.child.kill();
-        let _ = self.child.wait();
-    }
-}
+        for dst_x in 0..dst_width {
+            let x_fixed = (dst_x * x_ratio) as usize;
+            let x_int = x_fixed >> 16;
+            let x_frac = (x_fixed & 0xFFFF) as u32;
+            let x_inv = 0x10000 - x_frac;
 
-/// MJPEG stream parser that extracts individual JPEG frames
-struct MjpegParser<R: Read> {
-    reader: BufReader<R>,
-    buffer: Vec<u8>,
-}
+            let x0 = x_int * 3;
+            let x1 = ((x_int + 1).min((src_width - 1) as usize)) * 3;
 
-impl<R: Read> MjpegParser<R> {
-    fn new(reader: R) -> Self {
-        Self {
-            reader: BufReader::with_capacity(1024 * 1024, reader), // 1MB buffer
-            buffer: Vec::with_capacity(256 * 1024),                // 256KB initial frame buffer
-        }
-    }
+            // Bilinear interpolation for each channel
+            for c in 0..3 {
+                let p00 = src[src_row0 + x0 + c] as u32;
+                let p10 = src[src_row0 + x1 + c] as u32;
+                let p01 = src[src_row1 + x0 + c] as u32;
+                let p11 = src[src_row1 + x1 + c] as u32;
 
-    /// Read the next JPEG frame from the stream
-    fn next_frame(&mut self) -> color_eyre::Result<Option<Vec<u8>>> {
-        self.buffer.clear();
+                // Fixed-point bilinear interpolation
+                let top = (p00 * x_inv + p10 * x_frac) >> 16;
+                let bottom = (p01 * x_inv + p11 * x_frac) >> 16;
+                let value = (top * y_inv + bottom * y_frac) >> 16;
 
-        // Find SOI marker (start of JPEG)
-        if !self.find_marker(&JPEG_SOI)? {
-            return Ok(None);
-        }
-
-        self.buffer.extend_from_slice(&JPEG_SOI);
-
-        // Read until EOI marker (end of JPEG)
-        loop {
-            let byte = match self.read_byte()? {
-                Some(b) => b,
-                None => return Ok(None),
-            };
-
-            self.buffer.push(byte);
-
-            // Check for EOI marker
-            if self.buffer.len() >= 2 {
-                let len = self.buffer.len();
-                if self.buffer[len - 2] == JPEG_EOI[0] && self.buffer[len - 1] == JPEG_EOI[1] {
-                    // Found complete JPEG frame
-                    return Ok(Some(std::mem::take(&mut self.buffer)));
-                }
-            }
-
-            // Safety limit - JPEG frames shouldn't be larger than 10MB
-            if self.buffer.len() > 10 * 1024 * 1024 {
-                tracing::warn!("Frame too large, discarding");
-                self.buffer.clear();
-                return self.next_frame();
+                dst[dst_row + (dst_x as usize) * 3 + c] = value as u8;
             }
         }
     }
 
-    fn find_marker(&mut self, marker: &[u8; 2]) -> color_eyre::Result<bool> {
-        let mut prev_byte: Option<u8> = None;
-
-        loop {
-            let byte = match self.read_byte()? {
-                Some(b) => b,
-                None => return Ok(false),
-            };
-
-            if let Some(prev) = prev_byte {
-                if prev == marker[0] && byte == marker[1] {
-                    return Ok(true);
-                }
-            }
-
-            prev_byte = Some(byte);
-        }
-    }
-
-    fn read_byte(&mut self) -> color_eyre::Result<Option<u8>> {
-        let mut buf = [0u8; 1];
-        match self.reader.read(&mut buf)? {
-            0 => Ok(None),
-            _ => Ok(Some(buf[0])),
-        }
-    }
+    dst
 }
 
 #[tokio::main]
@@ -286,7 +226,8 @@ async fn main() -> color_eyre::Result<()> {
         .with(EnvFilter::from_default_env())
         .init();
 
-    let coordinator = FrameCoordinator::new();
+    // Output buffer uses scaled dimensions
+    let coordinator = FrameCoordinator::new(OUTPUT_WIDTH, OUTPUT_HEIGHT);
 
     // Start WebSocket server
     let coordinator_ws = coordinator.clone();
@@ -296,10 +237,8 @@ async fn main() -> color_eyre::Result<()> {
         }
     });
 
-    // Run camera capture in blocking thread
-    let coordinator_capture = coordinator.clone();
     tokio::task::spawn_blocking(move || {
-        if let Err(e) = run_camera_capture(coordinator_capture) {
+        if let Err(e) = run_camera_capture(coordinator) {
             tracing::error!("Camera capture error: {}", e);
         }
     })
@@ -308,7 +247,10 @@ async fn main() -> color_eyre::Result<()> {
     Ok(())
 }
 
-async fn run_websocket_server(addr: &str, coordinator: FrameCoordinator) -> color_eyre::Result<()> {
+async fn run_websocket_server(
+    addr: &str,
+    coordinator: FrameCoordinator,
+) -> color_eyre::Result<()> {
     let listener = TcpListener::bind(addr).await?;
     tracing::info!("WebSocket server listening on: {}", addr);
 
@@ -342,51 +284,55 @@ async fn handle_client(
         }
     };
 
-    coordinator.increment_clients();
     let (mut write, mut read) = ws_stream.split();
 
     while let Some(msg) = read.next().await {
         match msg {
             Ok(Message::Text(text)) => {
-                let text = text.trim();
-                if text == "s" || text == "snap" {
-                    // Get latest frame immediately
-                    tracing::debug!("Received snapshot command from {}", client_addr);
+                if text.trim() == "s" {
+                    tracing::debug!("Received 's' command from {}", client_addr);
 
-                    let jpeg_data = match coordinator.get_latest_frame().await {
+                    // Request a fresh frame from the camera
+                    let request_start = std::time::Instant::now();
+                    let rgb_data = match coordinator.request_frame().await {
                         Some(data) => data,
                         None => {
                             tracing::warn!("No frame available for client {}", client_addr);
                             continue;
                         }
                     };
-
                     tracing::debug!(
-                        "Sending frame to {}: {} bytes",
+                        "Frame request fulfilled for {} in {:?}",
                         client_addr,
-                        jpeg_data.len()
+                        request_start.elapsed()
                     );
 
-                    if let Err(e) = write.send(Message::Binary(jpeg_data.into())).await {
-                        tracing::error!("Error sending frame to {}: {}", client_addr, e);
-                        break;
-                    }
-                } else if text == "w" || text == "wait" {
-                    // Wait for a new frame
-                    tracing::debug!("Received wait command from {}", client_addr);
+                    let width = coordinator.width;
+                    let height = coordinator.height;
 
-                    let jpeg_data = match coordinator.wait_for_new_frame().await {
-                        Some(data) => data,
-                        None => {
-                            tracing::warn!("Timeout waiting for new frame for client {}", client_addr);
+                    let encode_start = std::time::Instant::now();
+                    let jpeg_data = match tokio::task::spawn_blocking(move || {
+                        encode_as_jpeg_turbo(&rgb_data, width, height, JPEG_QUALITY)
+                    })
+                        .await
+                    {
+                        Ok(Ok(data)) => data,
+                        Ok(Err(e)) => {
+                            tracing::error!("JPEG encoding error for client {}: {}", client_addr, e);
+                            continue;
+                        }
+                        Err(e) => {
+                            tracing::error!("Task join error for client {}: {}", client_addr, e);
                             continue;
                         }
                     };
 
+                    let encode_duration = encode_start.elapsed();
                     tracing::debug!(
-                        "Sending new frame to {}: {} bytes",
+                        "JPEG encoding completed for {}: {} bytes in {:?}",
                         client_addr,
-                        jpeg_data.len()
+                        jpeg_data.len(),
+                        encode_duration
                     );
 
                     if let Err(e) = write.send(Message::Binary(jpeg_data.into())).await {
@@ -410,67 +356,268 @@ async fn handle_client(
         }
     }
 
-    coordinator.decrement_clients();
     tracing::debug!("Connection handler for {} terminated", client_addr);
 }
 
 fn run_camera_capture(coordinator: FrameCoordinator) -> color_eyre::Result<()> {
-    // Find the appropriate video device
-    // /dev/video11 is typically the ISP output on Raspberry Pi
-    let device = "/dev/video11";
+    let camera_manager = CameraManager::new()?;
+    let cameras = camera_manager.cameras();
+
+    let cam = cameras.get(0).expect("No cameras found");
 
     tracing::info!(
-        "Starting v4l2-ctl capture from {} at {}x{}",
-        device,
-        CAPTURE_WIDTH,
-        CAPTURE_HEIGHT
+        "Using camera: {}",
+        *cam.properties().get::<properties::Model>()?
     );
 
-    let mut process = V4l2Process::spawn(device, CAPTURE_WIDTH, CAPTURE_HEIGHT)?;
+    let mut cam = cam.acquire()?;
 
-    let stdout = process
-        .take_stdout()
-        .ok_or_else(|| color_eyre::eyre::eyre!("Failed to get stdout from v4l2-ctl"))?;
+    let camera_stream = YuyvStream;
+    let (camera_stream, mut cfg) = if let Some(cfg) = camera_stream.is_supported(&cam) {
+        (camera_stream, cfg)
+    } else {
+        color_eyre::eyre::bail!("No supported stream format found");
+    };
 
-    let mut parser = MjpegParser::new(stdout);
-    let mut frame_count = 0u64;
-    let mut last_log = std::time::Instant::now();
+    // Capture at full resolution for better quality source
+    cfg.get_mut(0)
+        .unwrap()
+        .set_size(Size::new(CAPTURE_WIDTH, CAPTURE_HEIGHT));
 
-    tracing::info!("Camera capture loop starting");
+    match cfg.validate() {
+        CameraConfigurationStatus::Adjusted => {
+            tracing::warn!("Camera configuration was adjusted: {cfg:#?}")
+        }
+        CameraConfigurationStatus::Invalid => {
+            color_eyre::eyre::bail!("Error validating camera configuration")
+        }
+        _ => {}
+    }
+
+    cam.configure(&mut cfg)
+        .context("Unable to configure camera")?;
+
+    let mut alloc = FrameBufferAllocator::new(&cam);
+
+    let cfg_ref = cfg.get(0).unwrap();
+    let stream = cfg_ref.stream().unwrap();
+    let buffers = alloc.alloc(&stream)?;
+    tracing::debug!("Allocated {} buffers", buffers.len());
+
+    let buffers = buffers
+        .into_iter()
+        .map(|buf| MemoryMappedFrameBuffer::new(buf).unwrap())
+        .collect::<Vec<_>>();
+
+    let reqs = buffers
+        .into_iter()
+        .enumerate()
+        .map(|(i, buf)| {
+            let mut req = cam.create_request(Some(i as u64)).unwrap();
+            req.add_buffer(&stream, buf).unwrap();
+            req
+        })
+        .collect::<Vec<_>>();
+
+    let (tx, rx) = std::sync::mpsc::channel();
+    cam.on_request_completed(move |req| {
+        tx.send(req).unwrap();
+    });
+
+    cam.start(None)?;
+
+    // Buffer for full-resolution RGB conversion
+    let mut buffer = DoubleBuffer::new(cfg_ref.get_size());
+    let mut last_capture = std::time::Instant::now();
+
+    // Track whether we have requests queued
+    let mut requests_queued = 0;
+    let total_requests = reqs.len();
+
+    // Store requests for later queuing
+    let mut pending_requests: Vec<_> = reqs.into_iter().collect();
+
+    tracing::info!("Camera capture loop starting - will capture on demand only");
 
     loop {
-        match parser.next_frame() {
-            Ok(Some(jpeg_data)) => {
-                frame_count += 1;
+        // Wait for client demand if no frames are being processed
+        if requests_queued == 0 {
+            tracing::debug!("Waiting for client demand...");
 
-                // Log frame rate periodically
-                if last_log.elapsed() >= Duration::from_secs(10) {
-                    tracing::info!(
-                        "Captured {} frames, latest frame size: {} bytes, clients: {}",
-                        frame_count,
-                        jpeg_data.len(),
-                        coordinator.connected_clients.load(Ordering::SeqCst)
-                    );
-                    last_log = std::time::Instant::now();
-                }
-
-                tracing::trace!("Frame {} captured: {} bytes", frame_count, jpeg_data.len());
-
-                // Publish frame to coordinator
-                coordinator.publish_frame(jpeg_data);
+            // Wait up to 1 second for demand, then check again
+            // This allows the loop to remain responsive
+            if !coordinator.wait_for_demand(Duration::from_secs(1)) {
+                continue;
             }
-            Ok(None) => {
-                tracing::warn!("End of stream from v4l2-ctl");
+
+            tracing::debug!("Client demand detected, queuing capture requests");
+
+            // Queue requests to start capturing
+            while let Some(req) = pending_requests.pop() {
+                tracing::debug!("Request queued for execution: {req:#?}");
+                cam.queue_request(req).map_err(|(_, e)| e)?;
+                requests_queued += 1;
+            }
+        }
+
+        // Wait for a completed request
+        let mut req = match rx.recv_timeout(Duration::from_secs(10)) {
+            Ok(req) => {
+                requests_queued -= 1;
+                req
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                tracing::warn!("Timeout waiting for camera frame");
+                continue;
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                tracing::error!("Camera request channel disconnected");
                 break;
             }
-            Err(e) => {
-                tracing::error!("Error reading frame: {}", e);
-                // Try to continue on error
-                std::thread::sleep(Duration::from_millis(100));
+        };
+
+        tracing::debug!("Took {:?} since last capture", last_capture.elapsed());
+
+        let frame_data = {
+            let instant = std::time::Instant::now();
+
+            let framebuffer: &MemoryMappedFrameBuffer<FrameBuffer> = req.buffer(&stream).unwrap();
+            let frame_metadata_status = framebuffer.metadata().unwrap().status();
+
+            if frame_metadata_status != FrameMetadataStatus::Success {
+                tracing::error!("Frame metadata status: {:?}", frame_metadata_status);
+                req.reuse(ReuseFlag::REUSE_BUFFERS);
+
+                // Re-queue only if there's still demand
+                if coordinator.has_waiting_clients() {
+                    cam.queue_request(req).map_err(|(_, e)| e)?;
+                    requests_queued += 1;
+                } else {
+                    pending_requests.push(req);
+                }
+                continue;
             }
+
+            let bytes_used = framebuffer
+                .metadata()
+                .unwrap()
+                .planes()
+                .get(0)
+                .unwrap()
+                .bytes_used as usize;
+
+            let planes = framebuffer.data();
+            let frame_data = planes.get(0).unwrap();
+            tracing::debug!("Frame captured in {:?}", instant.elapsed());
+
+            &frame_data[..bytes_used]
+        };
+
+        // Convert YUYV to RGB at full resolution
+        let convert_instant = std::time::Instant::now();
+        camera_stream.convert_frame(&cfg_ref, frame_data, &mut buffer)?;
+        tracing::debug!("YUYV->RGB conversion in {:?}", convert_instant.elapsed());
+
+        // Scale down to output resolution
+        let scale_instant = std::time::Instant::now();
+        let scaled_rgb = scale_rgb_bilinear(
+            buffer.deref(),
+            CAPTURE_WIDTH,
+            CAPTURE_HEIGHT,
+            OUTPUT_WIDTH,
+            OUTPUT_HEIGHT,
+        );
+        tracing::debug!("Scaling in {:?}", scale_instant.elapsed());
+
+        req.reuse(ReuseFlag::REUSE_BUFFERS);
+
+        // Publish the frame to waiting clients
+        coordinator.publish_frame(scaled_rgb);
+        tracing::debug!("Frame published to clients");
+
+        last_capture = std::time::Instant::now();
+        buffer.swap();
+
+        // Re-queue the request only if there's still demand
+        if coordinator.has_waiting_clients() {
+            cam.queue_request(req).map_err(|(_, e)| e)?;
+            requests_queued += 1;
+        } else {
+            pending_requests.push(req);
+            tracing::debug!("No more waiting clients, pausing capture");
         }
     }
 
-    tracing::info!("Camera capture loop ended after {} frames", frame_count);
     Ok(())
+}
+
+thread_local! {
+    static COMPRESSOR: std::cell::RefCell<Option<Compressor>> = const { std::cell::RefCell::new(None) };
+}
+
+fn encode_as_jpeg_turbo(
+    rgb_data: &[u8],
+    width: u32,
+    height: u32,
+    quality: i32,
+) -> Result<Vec<u8>, String> {
+    COMPRESSOR.with(|comp_cell| {
+        let mut comp_opt = comp_cell.borrow_mut();
+
+        if comp_opt.is_none() {
+            let mut compressor = Compressor::new().map_err(|e| e.to_string())?;
+            compressor.set_quality(quality).map_err(|e| e.to_string())?;
+            // Use 4:2:0 subsampling for better compression
+            compressor
+                .set_subsamp(Subsamp::Sub2x2)
+                .map_err(|e| e.to_string())?;
+            *comp_opt = Some(compressor);
+        }
+
+        let compressor = comp_opt.as_mut().unwrap();
+
+        let image = Image {
+            pixels: rgb_data,
+            width: width as usize,
+            height: height as usize,
+            pitch: (width * 3) as usize,
+            format: TJPixelFormat::RGB,
+        };
+
+        compressor.compress_to_vec(image).map_err(|e| e.to_string())
+    })
+}
+
+trait CameraStream {
+    fn name(&self) -> &'static str;
+    fn is_supported(&self, camera: &Camera) -> Option<CameraConfiguration>;
+    fn convert_frame(
+        &self,
+        configuration: &StreamConfigurationRef,
+        data: &[u8],
+        target_buffer: &mut [u8],
+    ) -> color_eyre::Result<()>;
+}
+
+fn supports_configuration(cam: &Camera, format: PixelFormat) -> Option<CameraConfiguration> {
+    let mut cfgs = cam.generate_configuration(&[StreamRole::VideoRecording])?;
+    cfgs.get_mut(0)?.set_pixel_format(format);
+
+    tracing::trace!("Generated config: {cfgs:#?}");
+
+    match cfgs.validate() {
+        CameraConfigurationStatus::Valid => tracing::debug!("Camera configuration {format} valid!"),
+        CameraConfigurationStatus::Adjusted => {
+            tracing::trace!("Camera configuration was adjusted: {cfgs:#?}")
+        }
+        CameraConfigurationStatus::Invalid => {
+            tracing::trace!("Error validating camera configuration for {format}")
+        }
+    }
+
+    if cfgs.get(0).unwrap().get_pixel_format() != format {
+        return None;
+    }
+
+    Some(cfgs)
 }
