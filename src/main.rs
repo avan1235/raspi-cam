@@ -570,8 +570,8 @@ fn encode_as_jpeg_turbo(
 }
 
 trait CameraStream {
-    fn name(&self) -> &'static str;
     fn is_supported(&self, camera: &Camera) -> Option<CameraConfiguration>;
+
     fn convert_frame(
         &self,
         configuration: &StreamConfigurationRef,

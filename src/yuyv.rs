@@ -9,10 +9,6 @@ use super::{supports_configuration, CameraStream};
 pub struct YuyvStream;
 
 impl CameraStream for YuyvStream {
-    fn name(&self) -> &'static str {
-        "yuyv"
-    }
-
     fn is_supported(&self, camera: &Camera) -> Option<CameraConfiguration> {
         supports_configuration(camera, PixelFormat::from_str("YUYV").unwrap())
     }
