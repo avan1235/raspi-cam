@@ -1,5 +1,5 @@
 use super::{CameraStream, supports_configuration};
-use color_eyre::eyre::ContextCompat;
+use color_eyre::eyre::{eyre, ContextCompat};
 use libcamera::camera::{Camera, CameraConfiguration};
 use libcamera::color_space::{Range, YcbcrEncoding};
 use libcamera::pixel_format::PixelFormat;
@@ -43,7 +43,7 @@ impl CameraStream for YuyvStream {
                 YcbcrEncoding::Rec709 => YuvStandardMatrix::Bt709,
                 YcbcrEncoding::Rec2020 => YuvStandardMatrix::Bt2020,
                 YcbcrEncoding::None => {
-                    return Err("Unknown ycbcr_encoding, choose your default and put here".into());
+                    return Err(eyre!("Unknown ycbcr_encoding, choose your default and put here"));
                 }
             },
         )?;
