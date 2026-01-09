@@ -1,5 +1,14 @@
+use axum::response::Html;
+use axum::{
+    Router,
+    extract::{
+        State, WebSocketUpgrade,
+        ws::{Message, WebSocket},
+    },
+    response::IntoResponse,
+    routing::get,
+};
 use color_eyre::eyre::Context;
-use futures_util::{SinkExt, StreamExt};
 use libcamera::camera::{Camera, CameraConfiguration, CameraConfigurationStatus};
 use libcamera::camera_manager::CameraManager;
 use libcamera::framebuffer::AsFrameBuffer;
@@ -11,13 +20,11 @@ use libcamera::pixel_format::PixelFormat;
 use libcamera::request::ReuseFlag;
 use libcamera::stream::{StreamConfigurationRef, StreamRole};
 use libcamera::*;
-use std::ops::Deref;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::Duration;
-use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::{broadcast, watch};
-use tokio_tungstenite::{accept_async, tungstenite::Message};
+use tokio::sync::watch;
+use tower_http::trace::TraceLayer;
 use tracing_subscriber::EnvFilter;
 use tracing_subscriber::fmt;
 use tracing_subscriber::prelude::*;
@@ -34,32 +41,22 @@ const OUTPUT_WIDTH: u32 = 640;
 const OUTPUT_HEIGHT: u32 = 360;
 
 const WEBSOCKET_ADDRESS: &str = "0.0.0.0:8080";
-
-// Reduced quality for Pi 3B - balances quality vs encoding speed
 const JPEG_QUALITY: i32 = 75;
 
 /// Shared state for frame data and demand signaling
 struct FrameState {
-    /// The latest RGB frame data (scaled)
     rgb_data: Option<Vec<u8>>,
-    /// Frame sequence number - incremented each time a new frame is captured
     frame_seq: u64,
 }
 
 /// Coordinator for on-demand frame capture
 #[derive(Clone)]
 struct FrameCoordinator {
-    /// Current frame state
     state: Arc<Mutex<FrameState>>,
-    /// Condition variable to wake up camera thread when frames are needed
     frame_needed: Arc<Condvar>,
-    /// Number of clients currently waiting for a frame
     waiting_clients: Arc<AtomicUsize>,
-    /// Watch channel to notify clients when new frame is available
     frame_notify: watch::Sender<u64>,
-    /// Receiver for frame notifications
     frame_receiver: watch::Receiver<u64>,
-    /// Frame dimensions
     width: u32,
     height: u32,
 }
@@ -81,22 +78,17 @@ impl FrameCoordinator {
         }
     }
 
-    /// Called by clients to request a frame. Blocks until a fresh frame is available.
     async fn request_frame(&self) -> Option<Vec<u8>> {
-        // Get current frame sequence before signaling
         let current_seq = {
             let state = self.state.lock().unwrap();
             state.frame_seq
         };
 
-        // Increment waiting count and signal camera thread
         self.waiting_clients.fetch_add(1, Ordering::SeqCst);
         self.frame_needed.notify_one();
 
-        // Wait for a new frame (sequence number greater than what we saw)
         let mut receiver = self.frame_receiver.clone();
 
-        // Use tokio::select with timeout to avoid indefinite waiting
         let result = tokio::time::timeout(Duration::from_secs(5), async {
             loop {
                 if receiver.changed().await.is_err() {
@@ -108,13 +100,11 @@ impl FrameCoordinator {
                 }
             }
 
-            // Get the frame data
             let state = self.state.lock().unwrap();
             state.rgb_data.clone()
         })
         .await;
 
-        // Decrement waiting count
         self.waiting_clients.fetch_sub(1, Ordering::SeqCst);
 
         result.unwrap_or_else(|_| {
@@ -123,12 +113,10 @@ impl FrameCoordinator {
         })
     }
 
-    /// Called by camera thread to check if any clients need frames
     fn has_waiting_clients(&self) -> bool {
         self.waiting_clients.load(Ordering::SeqCst) > 0
     }
 
-    /// Called by camera thread to wait until clients need frames
     fn wait_for_demand(&self, timeout: Duration) -> bool {
         let state = self.state.lock().unwrap();
         let result = self
@@ -149,6 +137,18 @@ impl FrameCoordinator {
             state.frame_seq
         };
         let _ = self.frame_notify.send(new_seq);
+    }
+}
+
+/// Application state shared across all handlers
+#[derive(Clone)]
+struct AppState {
+    frame_coordinator: FrameCoordinator,
+}
+
+impl AppState {
+    fn new(frame_coordinator: FrameCoordinator) -> Self {
+        Self { frame_coordinator }
     }
 }
 
@@ -185,14 +185,12 @@ fn scale_rgb_bilinear(
             let x0 = x_int * 3;
             let x1 = ((x_int + 1).min((src_width - 1) as usize)) * 3;
 
-            // Bilinear interpolation for each channel
             for c in 0..3 {
                 let p00 = src[src_row0 + x0 + c] as u32;
                 let p10 = src[src_row0 + x1 + c] as u32;
                 let p01 = src[src_row1 + x0 + c] as u32;
                 let p11 = src[src_row1 + x1 + c] as u32;
 
-                // Fixed-point bilinear interpolation
                 let top = (p00 * x_inv + p10 * x_frac) >> 16;
                 let bottom = (p01 * x_inv + p11 * x_frac) >> 16;
                 let value = (top * y_inv + bottom * y_frac) >> 16;
@@ -205,91 +203,134 @@ fn scale_rgb_bilinear(
 
 #[tokio::main]
 async fn main() -> color_eyre::Result<()> {
+    color_eyre::install()?;
+
     tracing_subscriber::registry()
         .with(fmt::layer())
         .with(EnvFilter::from_default_env())
         .init();
 
-    // Output buffer uses scaled dimensions
     let coordinator = FrameCoordinator::new(OUTPUT_WIDTH, OUTPUT_HEIGHT);
+    let app_state = AppState::new(coordinator.clone());
 
-    // Start WebSocket server
-    let coordinator_ws = coordinator.clone();
-    tokio::spawn(async move {
-        if let Err(e) = run_websocket_server(WEBSOCKET_ADDRESS, coordinator_ws).await {
-            tracing::error!("WebSocket server error: {}", e);
-        }
-    });
-
+    // Start camera capture in a blocking task
     tokio::task::spawn_blocking(move || {
         if let Err(e) = run_camera_capture(coordinator) {
             tracing::error!("Camera capture error: {}", e);
         }
-    })
-    .await?;
+    });
+
+    // Build the application router
+    let app = create_router(app_state);
+
+    // Start the server
+    let listener = tokio::net::TcpListener::bind(WEBSOCKET_ADDRESS).await?;
+    tracing::info!("Server listening on: {}", WEBSOCKET_ADDRESS);
+
+    axum::serve(listener, app).await?;
 
     Ok(())
 }
 
-async fn run_websocket_server(addr: &str, coordinator: FrameCoordinator) -> color_eyre::Result<()> {
-    let listener = TcpListener::bind(addr).await?;
-    tracing::info!("WebSocket server listening on: {}", addr);
-
-    while let Ok((stream, addr)) = listener.accept().await {
-        tracing::info!("New WebSocket connection from: {}", addr);
-        let coordinator = coordinator.clone();
-        tokio::spawn(handle_client(stream, coordinator, addr));
-    }
-
-    Ok(())
+fn create_router(state: AppState) -> Router {
+    Router::new()
+        .route("/video", get(ws_handler))
+        .route("/", get(index_handler))
+        .layer(TraceLayer::new_for_http())
+        .with_state(state)
 }
 
-async fn handle_client(
-    stream: TcpStream,
-    coordinator: FrameCoordinator,
-    client_addr: std::net::SocketAddr,
-) {
-    tracing::debug!("Starting WebSocket handshake with client: {}", client_addr);
-    let ws_stream = match accept_async(stream).await {
-        Ok(ws) => {
-            tracing::debug!("WebSocket handshake successful with: {}", client_addr);
-            ws
+async fn index_handler() -> Html<&'static str> {
+    Html(
+        r#"<!DOCTYPE html>
+<html lang="EN">
+<head>
+    <title>Camera</title>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1">
+    <style>
+        body {
+            margin: 0;
+            width: 100%;
+            height: 100%;
         }
-        Err(e) => {
-            tracing::error!(
-                "Error during WebSocket handshake with {}: {}",
-                client_addr,
-                e
-            );
-            return;
+
+        img {
+            text-align: center;
+            display: block;
+            margin: auto;
+            max-width: 100%;
+            max-height: 100%;
+            width: auto;
+            height: auto;
         }
-    };
+    </style>
+</head>
+<body>
+<img id="video-frame" alt="loading video" src=""/>
+<script>
+    (function () {
+        const video_delay_ms = 100;
+        const url = `${window.location.host}:${window.location.port}`;
+        const camera = new WebSocket(`ws://${url}/video`);
+        const img = document.getElementById("video-frame");
 
-    let (mut write, mut read) = ws_stream.split();
+        function receiveVideoFrameLoop() {
+            camera.send("s");
+            setTimeout(receiveVideoFrameLoop, video_delay_ms);
+        }
 
-    while let Some(msg) = read.next().await {
+        camera.binaryType = "arraybuffer";
+        camera.onerror = (event) => img.alt = "camera websocket error";
+        camera.onopen = (event) => receiveVideoFrameLoop();
+        camera.onmessage = (event) => {
+            const uint_data = new Uint8Array(event.data);
+            const result = btoa([].reduce.call(uint_data, (p, c) => p + String.fromCharCode(c), ""));
+            img.src = "data:image/jpeg;base64," + result;
+        };
+    })();
+</script>
+</body>
+</html>"#,
+    )
+}
+
+/// WebSocket upgrade handler
+async fn ws_handler(ws: WebSocketUpgrade, State(state): State<AppState>) -> impl IntoResponse {
+    ws.on_upgrade(move |socket| handle_websocket(socket, state))
+}
+
+async fn handle_websocket(socket: WebSocket, state: AppState) {
+    let (mut sender, mut receiver) = socket.split();
+
+    use futures_util::{SinkExt, StreamExt};
+
+    while let Some(msg) = receiver.next().await {
+        let msg = match msg {
+            Ok(msg) => msg,
+            Err(e) => {
+                tracing::error!("WebSocket receive error: {}", e);
+                break;
+            }
+        };
+
         match msg {
-            Ok(Message::Text(text)) => {
+            Message::Text(text) => {
                 if text.trim() == "s" {
-                    tracing::debug!("Received 's' command from {}", client_addr);
+                    tracing::debug!("Received 's' command");
 
-                    // Request a fresh frame from the camera
                     let request_start = std::time::Instant::now();
-                    let rgb_data = match coordinator.request_frame().await {
+                    let rgb_data = match state.frame_coordinator.request_frame().await {
                         Some(data) => data,
                         None => {
-                            tracing::warn!("No frame available for client {}", client_addr);
+                            tracing::warn!("No frame available");
                             continue;
                         }
                     };
-                    tracing::debug!(
-                        "Frame request fulfilled for {} in {:?}",
-                        client_addr,
-                        request_start.elapsed()
-                    );
+                    tracing::debug!("Frame request fulfilled in {:?}", request_start.elapsed());
 
-                    let width = coordinator.width;
-                    let height = coordinator.height;
+                    let width = state.frame_coordinator.width;
+                    let height = state.frame_coordinator.height;
 
                     let encode_start = std::time::Instant::now();
                     let jpeg_data = match tokio::task::spawn_blocking(move || {
@@ -299,49 +340,40 @@ async fn handle_client(
                     {
                         Ok(Ok(data)) => data,
                         Ok(Err(e)) => {
-                            tracing::error!(
-                                "JPEG encoding error for client {}: {}",
-                                client_addr,
-                                e
-                            );
+                            tracing::error!("JPEG encoding error: {}", e);
                             continue;
                         }
                         Err(e) => {
-                            tracing::error!("Task join error for client {}: {}", client_addr, e);
+                            tracing::error!("Task join error: {}", e);
                             continue;
                         }
                     };
 
-                    let encode_duration = encode_start.elapsed();
                     tracing::debug!(
-                        "JPEG encoding completed for {}: {} bytes in {:?}",
-                        client_addr,
+                        "JPEG encoding completed: {} bytes in {:?}",
                         jpeg_data.len(),
-                        encode_duration
+                        encode_start.elapsed()
                     );
 
-                    if let Err(e) = write.send(Message::Binary(jpeg_data.into())).await {
-                        tracing::error!("Error sending frame to {}: {}", client_addr, e);
+                    if let Err(e) = sender.send(Message::Binary(jpeg_data.into())).await {
+                        tracing::error!("Error sending frame: {}", e);
                         break;
                     }
                 }
             }
-            Ok(Message::Close(frame)) => {
-                tracing::info!("Client {} disconnected: {:?}", client_addr, frame);
+            Message::Close(_) => {
+                tracing::info!("Client disconnected");
                 break;
             }
-            Ok(Message::Ping(_))
-            | Ok(Message::Pong(_))
-            | Ok(Message::Binary(_))
-            | Ok(Message::Frame(_)) => {}
-            Err(e) => {
-                tracing::error!("WebSocket error with {}: {}", client_addr, e);
-                break;
+            Message::Ping(data) => {
+                if let Err(e) = sender.send(Message::Pong(data)).await {
+                    tracing::error!("Error sending pong: {}", e);
+                    break;
+                }
             }
+            _ => {}
         }
     }
-
-    tracing::debug!("Connection handler for {} terminated", client_addr);
 }
 
 fn run_camera_capture(coordinator: FrameCoordinator) -> color_eyre::Result<()> {
@@ -414,28 +446,21 @@ fn run_camera_capture(coordinator: FrameCoordinator) -> color_eyre::Result<()> {
     let mut scaled = vec![0u8; (OUTPUT_WIDTH * OUTPUT_HEIGHT * 3) as usize];
     let mut last_capture = std::time::Instant::now();
 
-    // Track whether we have requests queued
     let mut requests_queued = 0;
-
-    // Store requests for later queuing
     let mut pending_requests: Vec<_> = reqs.into_iter().collect();
 
     tracing::info!("Camera capture loop starting - will capture on demand only");
 
     loop {
-        // Wait for client demand if no frames are being processed
         if requests_queued == 0 {
             tracing::debug!("Waiting for client demand...");
 
-            // Wait up to 1 second for demand, then check again
-            // This allows the loop to remain responsive
             if !coordinator.wait_for_demand(Duration::from_secs(1)) {
                 continue;
             }
 
             tracing::debug!("Client demand detected, queuing capture requests");
 
-            // Queue requests to start capturing
             while let Some(req) = pending_requests.pop() {
                 tracing::debug!("Request queued for execution: {req:#?}");
                 cam.queue_request(req).map_err(|(_, e)| e)?;
@@ -443,7 +468,6 @@ fn run_camera_capture(coordinator: FrameCoordinator) -> color_eyre::Result<()> {
             }
         }
 
-        // Wait for a completed request
         let mut req = match rx.recv_timeout(Duration::from_secs(10)) {
             Ok(req) => {
                 requests_queued -= 1;
@@ -471,7 +495,6 @@ fn run_camera_capture(coordinator: FrameCoordinator) -> color_eyre::Result<()> {
                 tracing::error!("Frame metadata status: {:?}", frame_metadata_status);
                 req.reuse(ReuseFlag::REUSE_BUFFERS);
 
-                // Re-queue only if there's still demand
                 if coordinator.has_waiting_clients() {
                     cam.queue_request(req).map_err(|(_, e)| e)?;
                     requests_queued += 1;
@@ -513,13 +536,11 @@ fn run_camera_capture(coordinator: FrameCoordinator) -> color_eyre::Result<()> {
 
         req.reuse(ReuseFlag::REUSE_BUFFERS);
 
-        // Publish the frame to waiting clients
         coordinator.publish_frame(&scaled);
         tracing::debug!("Frame published to clients");
 
         last_capture = std::time::Instant::now();
 
-        // Re-queue the request only if there's still demand
         if coordinator.has_waiting_clients() {
             cam.queue_request(req).map_err(|(_, e)| e)?;
             requests_queued += 1;
@@ -548,7 +569,6 @@ fn encode_as_jpeg_turbo(
         if comp_opt.is_none() {
             let mut compressor = Compressor::new().map_err(|e| e.to_string())?;
             compressor.set_quality(quality).map_err(|e| e.to_string())?;
-            // Use 4:2:0 subsampling for better compression
             compressor
                 .set_subsamp(Subsamp::Sub2x2)
                 .map_err(|e| e.to_string())?;
