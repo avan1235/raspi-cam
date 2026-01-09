@@ -271,8 +271,7 @@ async fn index_handler() -> Html<&'static str> {
 <script>
     (function () {
         const video_delay_ms = 100;
-        const url = `${window.location.host}:${window.location.port}`;
-        const camera = new WebSocket(`ws://${url}/video`);
+        const camera = new WebSocket(`ws://${window.location.host}/video`);
         const img = document.getElementById("video-frame");
 
         function receiveVideoFrameLoop() {
