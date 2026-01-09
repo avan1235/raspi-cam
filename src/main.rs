@@ -496,7 +496,6 @@ fn run_camera_capture(coordinator: FrameCoordinator) -> color_eyre::Result<()> {
             &frame_data[..bytes_used]
         };
 
-        // Convert YUYV to RGB at full resolution
         let convert_instant = std::time::Instant::now();
         camera_stream.convert_frame(&cfg_ref, frame_data, &mut buffer)?;
         tracing::debug!("YUYV->RGB conversion in {:?}", convert_instant.elapsed());
